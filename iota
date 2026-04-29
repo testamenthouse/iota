@@ -1,0 +1,700 @@
+#!/usr/bin/env bash
+# iota - Local WordPress Development CLI
+# Usage: iota <command> [options]
+
+set -euo pipefail
+
+# Resolve symlinks so SCRIPT_DIR always points to the actual repo, not /usr/local/bin
+_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$_SOURCE" ]]; do _SOURCE="$(readlink "$_SOURCE")"; done
+SCRIPT_DIR="$(cd "$(dirname "$_SOURCE")" && pwd)"
+SITES_DIR="$SCRIPT_DIR/sites"
+SERVICES_DIR="$SCRIPT_DIR/services"
+HOSTS_FILE="/etc/hosts"
+
+# Shared MySQL credentials (root access so iota can create per-site DBs)
+MYSQL_ROOT_PASS="iota_root_secret"
+MYSQL_CONTAINER="iota_mysql"
+TRAEFIK_CONTAINER="iota_traefik"
+
+# ─── Colors ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+
+log()    { echo -e "${CYAN}[iota]${RESET} $*"; }
+success(){ echo -e "${GREEN}[✓]${RESET} $*"; }
+warn()   { echo -e "${YELLOW}[!]${RESET} $*"; }
+error()  { echo -e "${RED}[✗]${RESET} $*" >&2; }
+header() { echo -e "\n${BOLD}${BLUE}$*${RESET}"; }
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+require_site() {
+  local name="$1"
+  [[ -d "$SITES_DIR/$name" ]] || { error "Site '$name' does not exist. Run: iota create $name"; exit 1; }
+}
+
+sanitize_name() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/^-//;s/-$//'
+}
+
+get_site_config() {
+  local name="$1" key="$2"
+  grep "^${key}=" "$SITES_DIR/$name/.iota" 2>/dev/null | cut -d'=' -f2- || true
+}
+
+get_site_dir() {
+  local name="$1"
+  local custom; custom="$(get_site_config "$name" SITE_PATH)"
+  [[ -n "$custom" ]] && echo "$custom" || echo "$SITES_DIR/$name"
+}
+
+list_running() {
+  docker ps --filter "label=iota.site" --format "{{.Label \"iota.site\"}}" 2>/dev/null | sort -u
+}
+
+pick_port() {
+  local lo="$1" hi="$2"
+  python3 -c "
+import socket, random
+for _ in range(200):
+    p = random.randint($lo, $hi)
+    s = socket.socket()
+    s.settimeout(0.5)
+    if s.connect_ex(('localhost', p)) != 0:
+        print(p)
+        break
+    s.close()
+"
+}
+
+ensure_mkcert() {
+  if ! command -v mkcert &>/dev/null; then
+    error "mkcert is not installed."
+    echo "  macOS:  brew install mkcert && mkcert -install"
+    echo "  Linux:  https://github.com/FiloSottile/mkcert#linux"
+    exit 1
+  fi
+  mkcert -install 2>/dev/null || true
+}
+
+# ── Shared services ────────────────────────────────────────────────────────────
+
+services_running() {
+  docker ps --filter "name=$MYSQL_CONTAINER" --filter "status=running" -q 2>/dev/null | grep -q . && \
+  docker ps --filter "name=$TRAEFIK_CONTAINER" --filter "status=running" -q 2>/dev/null | grep -q .
+}
+
+cmd_services_start() {
+  if services_running; then
+    log "Shared services already running."
+    return
+  fi
+  header "Starting shared services..."
+  mkdir -p "$SERVICES_DIR/traefik"
+  docker compose -f "$SERVICES_DIR/docker-compose.yml" up -d --remove-orphans
+  log "Waiting for MySQL to be ready..."
+  local retries=30
+  until docker exec "$MYSQL_CONTAINER" mysqladmin ping -h localhost -uroot -p"$MYSQL_ROOT_PASS" --silent 2>/dev/null; do
+    retries=$((retries-1))
+    [[ $retries -eq 0 ]] && { error "MySQL failed to start."; exit 1; }
+    sleep 1
+  done
+  success "Shared services running"
+}
+
+cmd_services_stop() {
+  header "Stopping shared services..."
+  docker compose -f "$SERVICES_DIR/docker-compose.yml" stop
+  success "Shared services stopped"
+}
+
+cmd_services_status() {
+  header "Shared Services"
+  if docker ps --filter "name=$MYSQL_CONTAINER" --filter "status=running" -q 2>/dev/null | grep -q .; then
+    echo -e "  MySQL    ${GREEN}running${RESET}  → 127.0.0.1:3306"
+  else
+    echo -e "  MySQL    ${RED}stopped${RESET}"
+  fi
+  if docker ps --filter "name=$TRAEFIK_CONTAINER" --filter "status=running" -q 2>/dev/null | grep -q .; then
+    echo -e "  Traefik  ${GREEN}running${RESET}  → https://localhost (proxy)"
+  else
+    echo -e "  Traefik  ${RED}stopped${RESET}"
+  fi
+  echo ""
+}
+
+mysql_exec() {
+  docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PASS" "$@"
+}
+
+ensure_site_db() {
+  local db_name="$1" db_user="$2" db_pass="$3"
+  mysql_exec <<SQL
+CREATE DATABASE IF NOT EXISTS \`${db_name}\`;
+CREATE USER IF NOT EXISTS '${db_user}'@'%' IDENTIFIED BY '${db_pass}';
+GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'%';
+FLUSH PRIVILEGES;
+SQL
+}
+
+drop_site_db() {
+  local db_name="$1" db_user="$2"
+  mysql_exec <<SQL
+DROP DATABASE IF EXISTS \`${db_name}\`;
+DROP USER IF EXISTS '${db_user}'@'%';
+FLUSH PRIVILEGES;
+SQL
+}
+
+# ─── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_help() {
+  printf "\n${BOLD}iota${RESET} — Local WordPress Development Environment Manager\n"
+  printf "\n${BOLD}USAGE${RESET}\n"
+  printf "  iota <command> [arguments]\n"
+  printf "\n${BOLD}SHARED SERVICES${RESET}\n"
+  printf "  services:start            Start shared services (MySQL, etc.) — auto-runs via create/start\n"
+  printf "  services:stop             Stop shared services\n"
+  printf "  services:status           Show shared services status\n"
+  printf "\n${BOLD}SITE MANAGEMENT${RESET}\n"
+  printf "  create <name> [domain] [--path <dir>]  Create a new WordPress site\n"
+  printf "  start  <name>             Start a site\n"
+  printf "  stop   <name>             Stop a site\n"
+  printf "  destroy <name>            Remove site containers, DB, and local domain\n"
+  printf "  list                      List all sites and their status\n"
+  printf "\n${BOLD}COMPOSER${RESET}\n"
+  printf "  compose <name>            Run composer install inside the site container\n"
+  printf "\n${BOLD}DATABASE${RESET}\n"
+  printf "  db:import <name> <file>   Import a .sql or .sql.gz dump into a site's DB\n"
+  printf "  db:export <name> [file]   Export a site's DB to a SQL dump\n"
+  printf "  db:shell  <name>          Open a MySQL shell scoped to a site's DB\n"
+  printf "\n${BOLD}TOOLS${RESET}\n"
+  printf "  shell  <name>             Open a bash shell in the WordPress container\n"
+  printf "  logs   <name>             Tail logs for a site\n"
+  printf "  open   <name>             Open site in your default browser\n"
+  printf "  wp     <name> [args...]   Run WP-CLI command inside container\n"
+  printf "\n${BOLD}COMPOSER WORKFLOW${RESET}\n"
+  printf "  1. iota create mysite mysite.local\n"
+  printf "  2. Drop composer.json into sites/mysite/\n"
+  printf "  3. iota start mysite\n"
+  printf "  4. iota compose mysite\n"
+  printf "     WordPress + plugins install into sites/mysite/public/\n\n"
+  printf "\n${BOLD}REQUIREMENTS${RESET}\n"
+  printf "  docker, mkcert  (brew install mkcert && mkcert -install)\n\n"
+}
+
+cmd_create() {
+  local raw_name="${1:-}"
+  [[ -z "$raw_name" ]] && { error "Usage: iota create <name> [domain] [--path <dir>]"; exit 1; }
+  shift
+
+  local domain="" custom_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --path) custom_path="${2:-}"; shift 2 ;;
+      --path=*) custom_path="${1#--path=}"; shift ;;
+      -*) error "Unknown option: $1"; exit 1 ;;
+      *) [[ -z "$domain" ]] && domain="$1"; shift ;;
+    esac
+  done
+
+  local name; name="$(sanitize_name "$raw_name")"
+  [[ -z "$domain" ]] && domain="${name}.local"
+
+  # Resolve custom_path to absolute
+  if [[ -n "$custom_path" ]]; then
+    if [[ -d "$custom_path" ]]; then
+      custom_path="$(cd "$custom_path" && pwd)"
+    elif [[ "$custom_path" != /* ]]; then
+      custom_path="$PWD/$custom_path"
+    fi
+  fi
+
+  # meta_dir: iota-managed files (.iota, certs, docker-compose.yml)
+  # site_dir: WordPress files (wp-config.php, apache/, public/)
+  local meta_dir="$SITES_DIR/$name"
+  local site_dir="${custom_path:-$meta_dir}"
+
+  [[ -d "$meta_dir" ]] && { error "Site '$name' already exists."; exit 1; }
+
+  header "Creating site: $name → https://$domain"
+
+  ensure_mkcert
+  cmd_services_start
+
+  local db_name="iota_${name}"
+  local db_user="iota_${name}"
+  local db_pass; db_pass="$(openssl rand -base64 16 | tr -d '=+/')"
+  local wp_prefix; wp_prefix="wp_$(openssl rand -hex 3)_"
+
+  mkdir -p "$meta_dir"/{certs,apache}
+  mkdir -p "$site_dir/public"
+  mkdir -p "$SERVICES_DIR/traefik"
+
+  # ── Create DB ───────────────────────────────────────────────────────────────
+  log "Creating database '$db_name' on shared MySQL..."
+  ensure_site_db "$db_name" "$db_user" "$db_pass"
+  success "Database ready"
+
+  # ── mkcert certificate ──────────────────────────────────────────────────────
+  # Certs live in meta_dir so Traefik can always find them at /sites/<name>/certs/.
+  log "Generating trusted SSL certificate for $domain..."
+  (
+    cd "$meta_dir/certs"
+    mkcert -cert-file cert.pem -key-file key.pem "$domain" "www.$domain" 2>/dev/null
+  )
+  success "Certificate generated"
+
+  # ── Traefik TLS config ───────────────────────────────────────────────────────
+  # Traefik file provider watches services/traefik/ and loads cert config for
+  # each site. The /sites mount in the Traefik container maps to SITES_DIR.
+  cat > "$SERVICES_DIR/traefik/${name}.yml" << EOF
+tls:
+  certificates:
+    - certFile: /sites/${name}/certs/cert.pem
+      keyFile:  /sites/${name}/certs/key.pem
+EOF
+
+  # ── wp-config.php ───────────────────────────────────────────────────────────
+  # Always generated into meta_dir; mounted into the container at public/wp-config.php.
+  # If a custom path was provided and has an existing wp-config.php, back it up there.
+  # WP_CONTENT_DIR points to public/app/ to match the Composer installer-paths layout.
+  if [[ -n "$custom_path" && -f "$custom_path/wp-config.php" ]]; then
+    log "Backing up existing wp-config.php → wp-config.php.bak..."
+    cp "$custom_path/wp-config.php" "$custom_path/wp-config.php.bak"
+    success "wp-config.php.bak created"
+  fi
+  log "Generating wp-config.php..."
+  cat > "$meta_dir/wp-config.php" << WPCONFIGEOF
+<?php
+define( 'DB_NAME',     '${db_name}' );
+define( 'DB_USER',     '${db_user}' );
+define( 'DB_PASSWORD', '${db_pass}' );
+define( 'DB_HOST',     'iota_mysql:3306' );
+define( 'DB_CHARSET',  'utf8mb4' );
+define( 'DB_COLLATE',  '' );
+
+\$table_prefix = '${wp_prefix}';
+
+define( 'WP_CONTENT_DIR', '/var/www/html/public/app' );
+define( 'WP_CONTENT_URL', 'https://${domain}/app' );
+
+define( 'WP_HOME',    'https://${domain}' );
+define( 'WP_SITEURL', 'https://${domain}' );
+
+define( 'FORCE_SSL_ADMIN', true );
+if ( isset( \$_SERVER['HTTP_X_FORWARDED_PROTO'] ) && \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {
+    \$_SERVER['HTTPS'] = 'on';
+}
+
+define( 'WP_DEBUG', false );
+define( 'WP_DEBUG_LOG', false );
+
+/* Authentication keys and salts — regenerate at https://api.wordpress.org/secret-key/1.1/salt/ */
+define( 'AUTH_KEY',         '$(openssl rand -base64 32)' );
+define( 'SECURE_AUTH_KEY',  '$(openssl rand -base64 32)' );
+define( 'LOGGED_IN_KEY',    '$(openssl rand -base64 32)' );
+define( 'NONCE_KEY',        '$(openssl rand -base64 32)' );
+define( 'AUTH_SALT',        '$(openssl rand -base64 32)' );
+define( 'SECURE_AUTH_SALT', '$(openssl rand -base64 32)' );
+define( 'LOGGED_IN_SALT',   '$(openssl rand -base64 32)' );
+define( 'NONCE_SALT',       '$(openssl rand -base64 32)' );
+
+// ABSPATH is hardcoded because wp-config.php is mounted one level above the
+// WordPress installation dir. __DIR__ would resolve to /var/www/html/public/
+// rather than /var/www/html/public/wp/ in that case.
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', '/var/www/html/public/wp/' );
+}
+require_once ABSPATH . 'wp-settings.php';
+WPCONFIGEOF
+  success "wp-config.php generated"
+
+  # ── Apache vhost ─────────────────────────────────────────────────────────────
+  # Apache serves HTTP only on port 80 — SSL is terminated by Traefik.
+  # Traefik sets X-Forwarded-Proto: https, which wp-config.php picks up.
+  # Document root is public/wp (WordPress core via Composer).
+  # /app alias serves wp-content (plugins, themes) from public/app.
+  cat > "$meta_dir/apache/iota.conf" << APACHEEOF
+<VirtualHost *:80>
+    ServerName ${domain}
+    ServerAlias www.${domain}
+    DocumentRoot /var/www/html/public/wp
+
+    RequestHeader set X-Forwarded-Proto "https"
+
+    # Serve wp-content (plugins/themes) from public/app
+    Alias /app /var/www/html/public/app
+
+    <Directory /var/www/html/public/wp>
+        Options FollowSymLinks
+        AllowOverride None
+        Require all granted
+        # WordPress rewrite rules inlined — avoids per-request .htaccess reads
+        RewriteEngine On
+        RewriteBase /
+        RewriteRule ^index\.php$ - [L]
+        RewriteCond %{REQUEST_FILENAME} !-f
+        RewriteCond %{REQUEST_FILENAME} !-d
+        RewriteRule . /index.php [L]
+    </Directory>
+
+    <Directory /var/www/html/public/app>
+        Options FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog  \${APACHE_LOG_DIR}/error.log
+    CustomLog \${APACHE_LOG_DIR}/access.log combined
+</VirtualHost>
+APACHEEOF
+
+  # ── Site config ─────────────────────────────────────────────────────────────
+  # docker-compose.yml always lives in meta_dir so cmd_start/stop/etc need no changes.
+  # SITE_PATH records where WordPress files live (same as meta_dir for default sites).
+  cat > "$meta_dir/.iota" << EOF
+NAME=$name
+DOMAIN=$domain
+SITE_PATH=$site_dir
+DB_NAME=$db_name
+DB_USER=$db_user
+DB_PASS=$db_pass
+WP_PREFIX=$wp_prefix
+CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+EOF
+
+  # ── docker-compose.yml ──────────────────────────────────────────────────────
+  # Always written to meta_dir so cmd_start/stop/logs use a stable path.
+  # Volumes always use absolute paths:
+  #   site_dir  → /var/www/html  (WordPress content: composer.json, public/, vendor/)
+  #   meta_dir  → conf files mounted individually (apache conf, wp-config)
+  cat > "$meta_dir/docker-compose.yml" << EOF
+version: '3.8'
+
+services:
+  wordpress:
+    build:
+      context: $SCRIPT_DIR
+      dockerfile: Dockerfile
+    image: iota-php:latest
+    container_name: ${name}_wordpress
+    restart: unless-stopped
+    environment:
+      COMPOSER_ALLOW_SUPERUSER: 1
+    volumes:
+      - ${site_dir}:/var/www/html
+      - ${meta_dir}/apache/iota.conf:/etc/apache2/sites-enabled/iota.conf:ro
+      - ${meta_dir}/wp-config.php:/var/www/html/public/wp-config.php:ro
+    command: >
+      bash -c "a2enmod rewrite headers alias && apache2-foreground"
+    networks:
+      - iota_services
+    labels:
+      iota.site: "$name"
+      traefik.enable: "true"
+      traefik.http.routers.${name}.rule: "Host(\`${domain}\`) || Host(\`www.${domain}\`)"
+      traefik.http.routers.${name}.entrypoints: "websecure"
+      traefik.http.routers.${name}.tls: "true"
+      traefik.http.services.${name}.loadbalancer.server.port: "80"
+
+networks:
+  iota_services:
+    external: true
+    name: iota_services
+EOF
+
+  # ── /etc/hosts ──────────────────────────────────────────────────────────────
+  if grep -q "[[:space:]]${domain}" "$HOSTS_FILE" 2>/dev/null; then
+    warn "Domain $domain already in $HOSTS_FILE — skipping."
+  else
+    log "Adding $domain to $HOSTS_FILE (requires sudo)..."
+    echo "127.0.0.1   $domain www.$domain" | sudo tee -a "$HOSTS_FILE" > /dev/null
+    success "Added $domain to hosts file"
+  fi
+
+  success "Site '$name' created!"
+  echo ""
+  echo -e "  ${BOLD}URL:${RESET}       https://$domain"
+  echo -e "  ${BOLD}Database:${RESET}  $db_name  (on shared MySQL)"
+  echo ""
+  echo -e "  Next steps:"
+  echo -e "    1. Drop your ${CYAN}composer.json${RESET} into ${CYAN}${site_dir}/${RESET}"
+  echo -e "    2. ${CYAN}iota start $name${RESET}"
+  echo -e "    3. ${CYAN}iota compose $name${RESET}"
+}
+
+cmd_start() {
+  local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota start <name>"; exit 1; }
+  require_site "$name"
+
+  cmd_services_start
+
+  local domain; domain="$(get_site_config "$name" DOMAIN)"
+
+  header "Starting $name..."
+  docker compose -f "$SITES_DIR/$name/docker-compose.yml" up -d --build --remove-orphans
+  success "Site running at https://$domain"
+}
+
+cmd_stop() {
+  local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota stop <name>"; exit 1; }
+  require_site "$name"
+  header "Stopping $name..."
+  docker compose -f "$SITES_DIR/$name/docker-compose.yml" stop
+  success "Stopped $name"
+}
+
+cmd_destroy() {
+  local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota destroy <name>"; exit 1; }
+  require_site "$name"
+
+  local domain; domain="$(get_site_config "$name" DOMAIN)"
+  local db_name; db_name="$(get_site_config "$name" DB_NAME)"
+  local db_user; db_user="$(get_site_config "$name" DB_USER)"
+
+  warn "This will permanently delete site '$name', its database, and SSL certs."
+  read -rp "Type the site name to confirm: " confirm
+  [[ "$confirm" != "$name" ]] && { error "Aborted."; exit 1; }
+
+  local custom_path is_custom=false
+  custom_path="$(get_site_config "$name" SITE_PATH)"
+  if [[ -n "$custom_path" && "$custom_path" != "$SITES_DIR/$name" ]]; then
+    is_custom=true
+  fi
+
+  local delete_meta="n"
+  if $is_custom; then
+    warn "Custom-path site — iota will only remove iota resources (certs, config, DB)."
+    warn "Your site files at '$custom_path' will NOT be touched."
+    read -rp "Delete iota resources at sites/$name/? [y/N] " delete_meta
+  else
+    read -rp "Also delete the site files at sites/$name/? [y/N] " delete_meta
+  fi
+
+  header "Destroying $name..."
+  docker compose -f "$SITES_DIR/$name/docker-compose.yml" down --remove-orphans 2>/dev/null || true
+
+  if docker ps --filter "name=$MYSQL_CONTAINER" --filter "status=running" -q 2>/dev/null | grep -q .; then
+    log "Dropping database '$db_name'..."
+    drop_site_db "$db_name" "$db_user"
+    success "Database dropped"
+  else
+    warn "Shared MySQL not running — skipping DB drop."
+  fi
+
+  if grep -q "[[:space:]]${domain}" "$HOSTS_FILE" 2>/dev/null; then
+    log "Removing $domain from $HOSTS_FILE (requires sudo)..."
+    sudo sed -i.bak "/[[:space:]]${domain}/d" "$HOSTS_FILE"
+    success "Removed $domain from hosts file"
+  fi
+
+  rm -f "$SERVICES_DIR/traefik/${name}.yml"
+
+  if [[ "$delete_meta" =~ ^[Yy]$ ]]; then
+    rm -rf "$SITES_DIR/$name"
+    success "Destroyed site '$name' (iota resources deleted)"
+  else
+    success "Destroyed site '$name' (iota resources kept at sites/$name/)"
+  fi
+}
+
+cmd_list() {
+  header "WordPress Sites"
+  local running_sites; running_sites="$(list_running)"
+
+  echo -n "  Shared MySQL: "
+  if services_running; then
+    echo -e "${GREEN}running${RESET}  → 127.0.0.1:3306"
+  else
+    echo -e "${RED}stopped${RESET}  (run: iota services:start)"
+  fi
+  echo ""
+
+  if [[ ! -d "$SITES_DIR" ]] || [[ -z "$(ls -A "$SITES_DIR" 2>/dev/null)" ]]; then
+    warn "No sites yet. Run: iota create <name>"
+    return
+  fi
+
+  printf "  %-20s %-30s %-24s %s\n" "NAME" "DOMAIN" "DATABASE" "STATUS"
+  printf "  %-20s %-30s %-24s %s\n" "----" "------" "--------" "------"
+
+  for site_dir in "$SITES_DIR"/*/; do
+    [[ -f "$site_dir/.iota" ]] || continue
+    local sname; sname="$(basename "$site_dir")"
+    local domain;  domain="$(get_site_config "$sname" DOMAIN)"
+    local db_name; db_name="$(get_site_config "$sname" DB_NAME)"
+
+    local status="${RED}stopped${RESET}"
+    echo "$running_sites" | grep -q "^${sname}$" && status="${GREEN}running${RESET}"
+
+    printf "  %-20s %-30s %-24s " "$sname" "$domain" "$db_name"
+    echo -e "$status"
+  done
+  echo ""
+}
+
+cmd_compose() {
+  local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota compose <name>"; exit 1; }
+  require_site "$name"
+
+  local site_dir; site_dir="$(get_site_dir "$name")"
+
+  # Generate a template composer.json if one doesn't exist
+  if [[ ! -f "$site_dir/composer.json" ]]; then
+    warn "No composer.json found — generating a template..."
+    cat > "$site_dir/composer.json" << 'COMPOSEREOF'
+{
+    "name": "iota/site",
+    "type": "project",
+    "require": {
+        "composer/installers": "^2.2",
+        "johnpbloch/wordpress": "^6.3.0"
+    },
+    "config": {
+        "allow-plugins": {
+            "composer/installers": true,
+            "johnpbloch/wordpress-core-installer": true
+        }
+    },
+    "extra": {
+        "installer-paths": {
+            "public/app/plugins/{$name}/": ["type:wordpress-plugin"],
+            "public/app/mu-plugins/{$name}/": ["type:wordpress-muplugin"],
+            "public/app/themes/{$name}/": ["type:wordpress-theme"]
+        },
+        "wordpress-install-dir": "public/wp"
+    },
+    "repositories": [
+        {
+            "type": "composer",
+            "url": "https://wpackagist.org",
+            "only": [
+                "wpackagist-plugin/*",
+                "wpackagist-theme/*"
+            ]
+        }
+    ]
+}
+COMPOSEREOF
+    success "Template composer.json created at sites/$name/composer.json"
+    warn "Edit it to add your plugins and themes, then re-run: iota compose $name"
+    echo ""
+  fi
+
+  # Make sure the container is running
+  if ! docker ps --filter "name=${name}_wordpress" --filter "status=running" -q | grep -q .; then
+    error "Site '$name' is not running. Run: iota start $name"
+    exit 1
+  fi
+
+  header "Running composer install for $name..."
+  docker exec -it "${name}_wordpress" bash -c "cd /var/www/html && composer install --no-interaction --prefer-dist"
+  success "Composer install complete"
+  echo ""
+  echo -e "  WordPress core: ${CYAN}${site_dir}/public/wp/${RESET}"
+  echo -e "  Plugins:        ${CYAN}${site_dir}/public/app/plugins/${RESET}"
+  echo -e "  Themes:         ${CYAN}${site_dir}/public/app/themes/${RESET}"
+}
+
+cmd_db_import() {
+  local name="${1:-}" file="${2:-}"
+  [[ -z "$name" || -z "$file" ]] && { error "Usage: iota db:import <name> <file.sql|file.sql.gz>"; exit 1; }
+  require_site "$name"
+  [[ -f "$file" ]] || { error "File not found: $file"; exit 1; }
+
+  local db_name; db_name="$(get_site_config "$name" DB_NAME)"
+
+  header "Importing database into $name ($db_name)..."
+
+  if [[ "$file" == *.gz ]]; then
+    log "Detected gzip — decompressing on the fly..."
+    gunzip -c "$file" | docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PASS" "$db_name"
+  else
+    docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PASS" "$db_name" < "$file"
+  fi
+
+  local domain; domain="$(get_site_config "$name" DOMAIN)"
+  success "Database imported!"
+  warn "Don't forget: iota wp $name search-replace 'https://old-domain.com' 'https://$domain' --all-tables"
+}
+
+cmd_db_export() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && { error "Usage: iota db:export <name> [output.sql]"; exit 1; }
+  require_site "$name"
+
+  local outfile="${2:-${name}_$(date +%Y%m%d_%H%M%S).sql}"
+  local db_name; db_name="$(get_site_config "$name" DB_NAME)"
+
+  header "Exporting database from $name ($db_name)..."
+  docker exec "$MYSQL_CONTAINER" mysqldump -uroot -p"$MYSQL_ROOT_PASS" "$db_name" > "$outfile"
+  success "Exported to $outfile"
+}
+
+cmd_db_shell() {
+  local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota db:shell <name>"; exit 1; }
+  require_site "$name"
+  local db_name; db_name="$(get_site_config "$name" DB_NAME)"
+  local db_pass; db_pass="$(get_site_config "$name" DB_PASS)"
+  local db_user; db_user="$(get_site_config "$name" DB_USER)"
+  log "Connecting to $db_name..."
+  docker exec -it "$MYSQL_CONTAINER" mysql -u"$db_user" -p"$db_pass" "$db_name"
+}
+
+cmd_shell() {
+  local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota shell <name>"; exit 1; }
+  require_site "$name"
+  docker exec -it "${name}_wordpress" bash
+}
+
+cmd_logs() {
+  local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota logs <name>"; exit 1; }
+  require_site "$name"
+  docker compose -f "$SITES_DIR/$name/docker-compose.yml" logs -f --tail=50
+}
+
+cmd_open() {
+  local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota open <name>"; exit 1; }
+  require_site "$name"
+  local domain; domain="$(get_site_config "$name" DOMAIN)"
+  local url="https://$domain"
+  log "Opening $url..."
+  if command -v open &>/dev/null; then open "$url"
+  elif command -v xdg-open &>/dev/null; then xdg-open "$url"
+  else warn "Could not open browser. Visit: $url"; fi
+}
+
+cmd_wp() {
+  local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota wp <name> [wp-cli args...]"; exit 1; }
+  require_site "$name"
+  shift
+  docker exec -it "${name}_wordpress" wp --allow-root --path=/var/www/html/public/wp "$@"
+}
+
+# ─── Router ───────────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    services:start)  cmd_services_start ;;
+    services:stop)   cmd_services_stop ;;
+    services:status) cmd_services_status ;;
+    create)    cmd_create "$@" ;;
+    start)     cmd_start "$@" ;;
+    stop)      cmd_stop "$@" ;;
+    destroy)   cmd_destroy "$@" ;;
+    list)      cmd_list ;;
+    compose)   cmd_compose "$@" ;;
+    db:import) cmd_db_import "$@" ;;
+    db:export) cmd_db_export "$@" ;;
+    db:shell)  cmd_db_shell "$@" ;;
+    shell)     cmd_shell "$@" ;;
+    logs)      cmd_logs "$@" ;;
+    open)      cmd_open "$@" ;;
+    wp)        cmd_wp "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *) error "Unknown command: $cmd"; cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"
