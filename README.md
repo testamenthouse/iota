@@ -159,6 +159,12 @@ Then run `iota compose mysite` again to install them.
 | `iota hosts` | Show the hosts file with iota entries highlighted |
 | `iota ui` | Interactive TUI (requires [gum](https://github.com/charmbracelet/gum)) |
 
+### Uninstall
+
+| Command | Description |
+|---|---|
+| `iota uninstall` | Remove all Docker objects (containers, volumes, network, image), hosts entries, and `/usr/local/bin/iota` symlink. Site files in `sites/` are preserved. |
+
 ---
 
 ## Custom Path

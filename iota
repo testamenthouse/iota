@@ -134,7 +134,7 @@ EOF
   docker compose -f "$SERVICES_DIR/docker-compose.yml" up -d --remove-orphans
   log "Waiting for MySQL to be ready..."
   local retries=30
-  until docker exec "$MYSQL_CONTAINER" mysqladmin ping -h localhost -uroot -p"$MYSQL_ROOT_PASS" --silent 2>/dev/null; do
+  until docker exec "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PASS" -e "SELECT 1" &>/dev/null; do
     retries=$((retries-1))
     [[ $retries -eq 0 ]] && { error "MySQL failed to start."; exit 1; }
     sleep 1
@@ -229,6 +229,8 @@ cmd_help() {
   printf "  wp     <name> [args...]   Run WP-CLI command inside container\n"
   printf "  hosts                     Show the hosts file with iota entries highlighted\n"
   printf "  ui                        Interactive TUI (requires gum)\n"
+  printf "\n${BOLD}UNINSTALL${RESET}\n"
+  printf "  uninstall                 Remove all Docker objects, hosts entries, and symlink\n"
   printf "\n${BOLD}COMPOSER WORKFLOW${RESET}\n"
   printf "  1. iota create mysite mysite.local\n"
   printf "  2. Drop composer.json into sites/mysite/\n"
@@ -586,6 +588,73 @@ cmd_destroy() {
   else
     success "Destroyed site '$name' (iota resources kept at sites/$name/)"
   fi
+}
+
+cmd_uninstall() {
+  header "iota Uninstall"
+  warn "This will:"
+  echo "  • Stop and remove ALL site containers"
+  echo "  • Stop and remove shared services (MySQL, Traefik, Adminer)"
+  echo "  • Remove Docker volumes, network, and iota-php image"
+  echo "  • Remove all iota entries from /etc/hosts"
+  echo "  • Remove /usr/local/bin/iota symlink"
+  echo ""
+  warn "Site files in sites/ will be preserved."
+  echo ""
+  read -rp "Type 'uninstall' to confirm: " confirm
+  [[ "$confirm" != "uninstall" ]] && { error "Aborted."; exit 1; }
+
+  # 1. Stop all site containers
+  if [[ -d "$SITES_DIR" ]]; then
+    for site_dir in "$SITES_DIR"/*/; do
+      [[ -f "$site_dir/.iota" ]] || continue
+      local sname; sname="$(basename "$site_dir")"
+      if [[ -f "$site_dir/docker-compose.yml" ]]; then
+        log "Stopping $sname..."
+        docker compose -f "$site_dir/docker-compose.yml" down --remove-orphans 2>/dev/null || true
+      fi
+    done
+  fi
+
+  # 2. Stop shared services and remove volumes
+  if [[ -f "$SERVICES_DIR/docker-compose.yml" ]]; then
+    log "Stopping shared services..."
+    docker compose -f "$SERVICES_DIR/docker-compose.yml" down --volumes --remove-orphans 2>/dev/null || true
+  fi
+
+  # 3. Remove Docker network
+  if docker network inspect iota_services &>/dev/null; then
+    log "Removing iota_services network..."
+    docker network rm iota_services 2>/dev/null || true
+  fi
+
+  # 4. Remove iota-php image
+  if docker image inspect iota-php:latest &>/dev/null; then
+    log "Removing iota-php:latest image..."
+    docker rmi iota-php:latest 2>/dev/null || true
+  fi
+
+  # 5. Remove all iota entries from /etc/hosts
+  if grep -q "# iota:" "$HOSTS_FILE" 2>/dev/null; then
+    log "Removing iota entries from $HOSTS_FILE (requires sudo)..."
+    sudo sed -i.bak '/# iota:/d' "$HOSTS_FILE"
+    success "Cleaned hosts file"
+  fi
+
+  # 6. Remove generated Traefik configs and service certs
+  rm -f "$SERVICES_DIR"/traefik/*.yml
+  rm -f "$SERVICES_DIR"/certs/*.pem
+
+  # 7. Remove symlink
+  if [[ -L /usr/local/bin/iota ]]; then
+    log "Removing /usr/local/bin/iota symlink (requires sudo)..."
+    sudo rm -f /usr/local/bin/iota
+    success "Symlink removed"
+  fi
+
+  success "iota has been uninstalled."
+  log "Site files in sites/ have been preserved."
+  log "To re-install, run: ./install.sh"
 }
 
 cmd_list() {
@@ -1239,7 +1308,7 @@ cmd_ui() {
     local choice
     choice=$(gum choose \
       --header "$(gum style --foreground $GUM_ACCENT --bold '  MAIN MENU')" \
-      --cursor "▸ " --height 20 \
+      --cursor "▸ " --height 23 \
       --cursor.foreground $GUM_ACCENT \
       --selected.foreground $GUM_ACCENT \
       "🆕  Create a new site" \
@@ -1262,6 +1331,7 @@ cmd_ui() {
       "📊  Show services status" \
       "🌍  View hosts file" \
       "📖  View README" \
+      "🗑️   Uninstall iota" \
       "👋  Exit") || break
 
     case "$choice" in
@@ -1285,6 +1355,7 @@ cmd_ui() {
       *"Show services status")   cmd_services_status; ui_pause ;;
       *"View hosts file")        cmd_hosts; ui_pause ;;
       *"View README")            glow -p "$SCRIPT_DIR/README.md" ;;
+      *"Uninstall iota")         cmd_uninstall; break ;;
       *"Exit")                   break ;;
       "")                        break ;;
       *)                         continue ;;
@@ -1319,6 +1390,7 @@ main() {
     wp)        cmd_wp "$@" ;;
     hosts)     cmd_hosts ;;
     ui)        cmd_ui ;;
+    uninstall) cmd_uninstall ;;
     help|--help|-h) cmd_help ;;
     *) error "Unknown command: $cmd"; cmd_help; exit 1 ;;
   esac
