@@ -50,6 +50,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik:/etc/traefik/dynamic:ro
       - ../sites:/sites:ro
+      - ./certs:/certs:ro
     networks:
       - iota_services
     healthcheck:
@@ -64,6 +65,30 @@ services:
         max-file: "3"
     labels:
       iota.service: traefik
+
+  adminer:
+    image: adminer:latest
+    container_name: iota_adminer
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: iota_mysql
+      ADMINER_DESIGN: pepa-linha-dark
+    volumes:
+      - ./adminer/index.php:/var/www/html/index.php:ro
+    networks:
+      - iota_services
+    labels:
+      iota.service: adminer
+      traefik.enable: "true"
+      traefik.http.routers.adminer.rule: "Host(`db.local`)"
+      traefik.http.routers.adminer.entrypoints: "websecure"
+      traefik.http.routers.adminer.tls: "true"
+      traefik.http.services.adminer.loadbalancer.server.port: "8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ── Future services ──────────────────────────────────────────────────────────
   # Uncomment to enable:

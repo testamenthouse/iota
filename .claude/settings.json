@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(printf '\\\\033[48;2;15;50;120m\\\\033[1;37m         test         \\\\033[0m\\\\n')",
+      "Bash(gum style --no-strip-ansi --border double --border-foreground 33)"
+    ]
+  }
+}

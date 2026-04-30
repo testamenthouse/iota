@@ -13,7 +13,7 @@ INSTALL_LINK="/usr/local/bin/iota"
 export CLICOLOR_FORCE=1
 
 # ── Colors ────────────────────────────────────────────────────────────────────
-PINK='\033[38;5;212m'
+BLUE='\033[38;5;33m'
 GREEN='\033[38;5;120m'
 RED='\033[38;5;203m'
 YELLOW='\033[38;5;221m'
@@ -29,17 +29,17 @@ banner() {
   echo ""
   if $HAS_GUM; then
     gum style \
-      --foreground 212 --border-foreground 212 \
+      --foreground 33 --border-foreground 33 \
       --border double --align center \
       --width 50 --margin "0 0" --padding "1 2" \
       '⚡ iota' 'installer'
   else
-    echo -e "${PINK}╔══════════════════════════════════════════════════╗${RESET}"
-    echo -e "${PINK}║                                                  ║${RESET}"
-    echo -e "${PINK}║${RESET}               ${PINK}${BOLD}⚡ iota${RESET}                            ${PINK}║${RESET}"
-    echo -e "${PINK}║${RESET}              ${PINK}installer${RESET}                           ${PINK}║${RESET}"
-    echo -e "${PINK}║                                                  ║${RESET}"
-    echo -e "${PINK}╚══════════════════════════════════════════════════╝${RESET}"
+    echo -e "${BLUE}╔══════════════════════════════════════════════════╗${RESET}"
+    echo -e "${BLUE}║                                                  ║${RESET}"
+    echo -e "${BLUE}║${RESET}               ${BLUE}${BOLD}⚡ iota${RESET}                            ${BLUE}║${RESET}"
+    echo -e "${BLUE}║${RESET}              ${BLUE}installer${RESET}                           ${BLUE}║${RESET}"
+    echo -e "${BLUE}║                                                  ║${RESET}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════╝${RESET}"
   fi
   echo ""
 }
@@ -47,17 +47,17 @@ banner() {
 section() {
   echo ""
   if $HAS_GUM; then
-    gum style --foreground 212 --bold --border rounded --border-foreground 240 \
+    gum style --foreground 33 --bold --border rounded --border-foreground 240 \
       --padding "0 1" --margin "0 1" "$1"
   else
-    echo -e "  ${PINK}${BOLD}$1${RESET}"
+    echo -e "  ${BLUE}${BOLD}$1${RESET}"
     echo -e "  ${DIM}$(printf '%.0s─' {1..46})${RESET}"
   fi
 }
 
 ok()   { echo -e "  ${GREEN}✓${RESET}  $*"; }
 fail() { echo -e "  ${RED}✗${RESET}  $*" >&2; }
-info() { echo -e "  ${PINK}→${RESET}  $*"; }
+info() { echo -e "  ${BLUE}→${RESET}  $*"; }
 skip() { echo -e "  ${YELLOW}○${RESET}  $*"; }
 
 # ── Dependency checks ────────────────────────────────────────────────────────
@@ -130,18 +130,18 @@ if $HAS_GUM; then
     --width 50 --padding "1 2" \
     '✓ Installation complete!'
   echo ""
-  gum style --foreground 212 --bold --margin "0 1" "Get started"
+  gum style --foreground 33 --bold --margin "0 1" "Get started"
 else
   echo -e "  ${GREEN}${BOLD}✓ Installation complete!${RESET}"
   echo ""
-  echo -e "  ${PINK}${BOLD}Get started${RESET}"
+  echo -e "  ${BLUE}${BOLD}Get started${RESET}"
 fi
 
 echo ""
-echo -e "  ${PINK}iota create mysite mysite.local${RESET}"
-echo -e "  ${PINK}iota start mysite${RESET}"
+echo -e "  ${BLUE}iota create mysite mysite.local${RESET}"
+echo -e "  ${BLUE}iota start mysite${RESET}"
 echo -e "  ${DIM}  → https://mysite.local  (trusted SSL)${RESET}"
 echo ""
-echo -e "  ${PINK}iota ui${RESET}    ${DIM}interactive mode${RESET}"
-echo -e "  ${PINK}iota help${RESET}  ${DIM}all commands${RESET}"
+echo -e "  ${BLUE}iota ui${RESET}    ${DIM}interactive mode${RESET}"
+echo -e "  ${BLUE}iota help${RESET}  ${DIM}all commands${RESET}"
 echo ""

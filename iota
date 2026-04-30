@@ -21,13 +21,18 @@ TRAEFIK_CONTAINER="iota_traefik"
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+BLUE='\033[38;5;33m'; CYAN='\033[38;5;44m'; TEAL='\033[38;5;37m'
+BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+
+# gum accent color (ANSI 256) — used across all gum style/choose calls
+GUM_ACCENT=33
 
 log()    { echo -e "${CYAN}[iota]${RESET} $*"; }
 success(){ echo -e "${GREEN}[✓]${RESET} $*"; }
 warn()   { echo -e "${YELLOW}[!]${RESET} $*"; }
 error()  { echo -e "${RED}[✗]${RESET} $*" >&2; }
 header() { echo -e "\n${BOLD}${BLUE}$*${RESET}"; }
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 require_site() {
@@ -103,6 +108,29 @@ cmd_services_start() {
   fi
   header "Starting shared services..."
   mkdir -p "$SERVICES_DIR/traefik"
+  mkdir -p "$SERVICES_DIR/certs"
+
+  # ── Adminer TLS (db.local) ──────────────────────────────────────────────────
+  if [[ ! -f "$SERVICES_DIR/certs/cert.pem" ]]; then
+    ensure_mkcert
+    log "Generating SSL certificate for db.local..."
+    ( cd "$SERVICES_DIR/certs" && mkcert -cert-file cert.pem -key-file key.pem db.local 2>/dev/null )
+    success "Certificate generated for db.local"
+  fi
+  if [[ ! -f "$SERVICES_DIR/traefik/adminer.yml" ]]; then
+    cat > "$SERVICES_DIR/traefik/adminer.yml" << EOF
+tls:
+  certificates:
+    - certFile: /certs/cert.pem
+      keyFile:  /certs/key.pem
+EOF
+  fi
+  if ! grep -q "db\.local" "$HOSTS_FILE" 2>/dev/null; then
+    log "Adding db.local to $HOSTS_FILE (requires sudo)..."
+    echo "127.0.0.1   db.local  # iota: adminer" | sudo tee -a "$HOSTS_FILE" > /dev/null
+    success "Added db.local to hosts file"
+  fi
+
   docker compose -f "$SERVICES_DIR/docker-compose.yml" up -d --remove-orphans
   log "Waiting for MySQL to be ready..."
   local retries=30
@@ -131,6 +159,11 @@ cmd_services_status() {
     echo -e "  Traefik  ${GREEN}running${RESET}  → https://localhost (proxy)"
   else
     echo -e "  Traefik  ${RED}stopped${RESET}"
+  fi
+  if docker ps --filter "name=iota_adminer" --filter "status=running" -q 2>/dev/null | grep -q .; then
+    echo -e "  Adminer  ${GREEN}running${RESET}  → https://db.local"
+  else
+    echo -e "  Adminer  ${RED}stopped${RESET}"
   fi
   echo ""
 }
@@ -178,14 +211,17 @@ cmd_help() {
   printf "\n${BOLD}COMPOSER${RESET}\n"
   printf "  compose <name>            Run composer install inside the site container\n"
   printf "\n${BOLD}DATABASE${RESET}\n"
+  printf "  db:open                   Open Adminer (https://db.local) in browser\n"
   printf "  db:import <name> <file>   Import a .sql or .sql.gz dump into a site's DB\n"
   printf "  db:export <name> [file]   Export a site's DB to a SQL dump\n"
   printf "  db:shell  <name>          Open a MySQL shell scoped to a site's DB\n"
   printf "\n${BOLD}TOOLS${RESET}\n"
+  printf "  info   <name>             Show site config (domain, DB credentials, paths)\n"
   printf "  shell  <name>             Open a bash shell in the WordPress container\n"
   printf "  logs   <name>             Tail logs for a site\n"
   printf "  open   <name>             Open site in your default browser\n"
   printf "  wp     <name> [args...]   Run WP-CLI command inside container\n"
+  printf "  hosts                     Show the hosts file with iota entries highlighted\n"
   printf "  ui                        Interactive TUI (requires gum)\n"
   printf "\n${BOLD}COMPOSER WORKFLOW${RESET}\n"
   printf "  1. iota create mysite mysite.local\n"
@@ -431,7 +467,7 @@ EOF
     warn "Domain $domain already in $HOSTS_FILE — skipping."
   else
     log "Adding $domain to $HOSTS_FILE (requires sudo)..."
-    echo "127.0.0.1   $domain www.$domain" | sudo tee -a "$HOSTS_FILE" > /dev/null
+    echo "127.0.0.1   $domain www.$domain  # iota: $site_dir" | sudo tee -a "$HOSTS_FILE" > /dev/null
     success "Added $domain to hosts file"
   fi
 
@@ -526,7 +562,11 @@ cmd_destroy() {
     warn "Shared MySQL not running — skipping DB drop."
   fi
 
-  if grep -q "[[:space:]]${domain}" "$HOSTS_FILE" 2>/dev/null; then
+  if grep -q "# iota:.*${name}" "$HOSTS_FILE" 2>/dev/null; then
+    log "Removing $domain from $HOSTS_FILE (requires sudo)..."
+    sudo sed -i.bak "\|# iota:.*${name}|d" "$HOSTS_FILE"
+    success "Removed $domain from hosts file"
+  elif grep -q "[[:space:]]${domain}" "$HOSTS_FILE" 2>/dev/null; then
     log "Removing $domain from $HOSTS_FILE (requires sudo)..."
     sudo sed -i.bak "\|[[:space:]]${domain}|d" "$HOSTS_FILE"
     success "Removed $domain from hosts file"
@@ -712,6 +752,19 @@ cmd_logs() {
   docker compose -f "$SITES_DIR/$name/docker-compose.yml" logs -f --tail=50
 }
 
+cmd_hosts() {
+  header "Hosts file ($HOSTS_FILE)"
+  echo ""
+  while IFS= read -r line; do
+    if [[ "$line" == *"# iota:"* ]]; then
+      echo -e "  ${GREEN}${line}${RESET}"
+    else
+      echo "  $line"
+    fi
+  done < "$HOSTS_FILE"
+  echo ""
+}
+
 cmd_open() {
   local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota open <name>"; exit 1; }
   require_site "$name"
@@ -721,6 +774,56 @@ cmd_open() {
   if command -v open &>/dev/null; then open "$url"
   elif command -v xdg-open &>/dev/null; then xdg-open "$url"
   else warn "Could not open browser. Visit: $url"; fi
+}
+
+cmd_db_open() {
+  local url="https://db.local"
+  log "Opening $url..."
+  if command -v open &>/dev/null; then open "$url"
+  elif command -v xdg-open &>/dev/null; then xdg-open "$url"
+  else warn "Could not open browser. Visit: $url"; fi
+}
+
+cmd_info() {
+  local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota info <name>"; exit 1; }
+  require_site "$name"
+
+  local domain; domain="$(get_site_config "$name" DOMAIN)"
+  local site_path; site_path="$(get_site_config "$name" SITE_PATH)"
+  local db_name; db_name="$(get_site_config "$name" DB_NAME)"
+  local db_user; db_user="$(get_site_config "$name" DB_USER)"
+  local db_pass; db_pass="$(get_site_config "$name" DB_PASS)"
+  local wp_prefix; wp_prefix="$(get_site_config "$name" WP_PREFIX)"
+  local created; created="$(get_site_config "$name" CREATED)"
+
+  # Container status
+  local status="${RED}stopped${RESET}"
+  if docker ps --filter "name=${name}_wordpress" --filter "status=running" -q 2>/dev/null | grep -q .; then
+    status="${GREEN}running${RESET}"
+  fi
+
+  # Custom path indicator
+  local path_label="$site_path"
+  if [[ "$site_path" != "$SITES_DIR/$name" ]]; then
+    path_label="$site_path ${DIM}(custom)${RESET}"
+  fi
+
+  echo ""
+  echo -e "  ${BOLD}${BLUE}⚡ iota${RESET} ${BOLD}— ${name}${RESET}"
+  echo -e "  ────────────────────────────────────────"
+  echo -e "  ${BOLD}Status${RESET}     $status"
+  echo -e "  ${BOLD}Domain${RESET}     https://$domain"
+  echo -e "  ${BOLD}Adminer${RESET}    https://db.local"
+  echo -e "  ${BOLD}Path${RESET}       $path_label"
+  echo -e "  ────────────────────────────────────────"
+  echo -e "  ${BOLD}DB Name${RESET}    $db_name"
+  echo -e "  ${BOLD}DB User${RESET}    $db_user"
+  echo -e "  ${BOLD}DB Pass${RESET}    $db_pass"
+  echo -e "  ${BOLD}DB Host${RESET}    iota_mysql:3306 ${DIM}(127.0.0.1:3306 from host)${RESET}"
+  echo -e "  ${BOLD}Prefix${RESET}     $wp_prefix"
+  echo -e "  ────────────────────────────────────────"
+  echo -e "  ${BOLD}Created${RESET}    $created"
+  echo ""
 }
 
 cmd_wp() {
@@ -755,7 +858,7 @@ ui_pick_site() {
     return 1
   fi
   local selected
-  selected=$(gum choose --header "$header" --cursor "▸ " --cursor.foreground 99 "${sites[@]}") || return 1
+  selected=$(gum choose --header "$header" --cursor "▸ " --cursor.foreground $GUM_ACCENT "${sites[@]}") || return 1
   # Extract site name from "🟢  name (domain)" format
   echo "$selected" | sed 's/^[^ ]*  //' | sed 's/ (.*//'
 }
@@ -776,7 +879,7 @@ ui_pick_running_site() {
     return 1
   fi
   local selected
-  selected=$(gum choose --header "$header" --cursor "▸ " --cursor.foreground 99 "${sites[@]}") || return 1
+  selected=$(gum choose --header "$header" --cursor "▸ " --cursor.foreground $GUM_ACCENT "${sites[@]}") || return 1
   echo "$selected" | sed 's/^[^ ]*  //' | sed 's/ (.*//'
 }
 
@@ -852,7 +955,11 @@ ui_destroy() {
     warn "Shared MySQL not running — skipping DB drop."
   fi
 
-  if grep -q "[[:space:]]${domain}" "$HOSTS_FILE" 2>/dev/null; then
+  if grep -q "# iota:.*${name}" "$HOSTS_FILE" 2>/dev/null; then
+    log "Removing $domain from $HOSTS_FILE (requires sudo)..."
+    sudo sed -i.bak "\|# iota:.*${name}|d" "$HOSTS_FILE"
+    success "Removed $domain from hosts file"
+  elif grep -q "[[:space:]]${domain}" "$HOSTS_FILE" 2>/dev/null; then
     log "Removing $domain from $HOSTS_FILE (requires sudo)..."
     sudo sed -i.bak "\|[[:space:]]${domain}|d" "$HOSTS_FILE"
     success "Removed $domain from hosts file"
@@ -866,6 +973,13 @@ ui_destroy() {
   else
     success "Destroyed site '$name' (iota resources kept at sites/$name/)"
   fi
+  ui_pause
+}
+
+ui_info() {
+  local name
+  name=$(ui_pick_site "Show info for which site?") || return
+  cmd_info "$name"
   ui_pause
 }
 
@@ -883,7 +997,7 @@ ui_list() {
   if services_running; then
     mysql_status="🟢 running → 127.0.0.1:3306"
   fi
-  gum style --foreground 99 --bold --margin "0 1" "Shared MySQL: $mysql_status"
+  gum style --foreground $GUM_ACCENT --bold --margin "0 1" "Shared MySQL: $mysql_status"
 
   if [[ ! -d "$SITES_DIR" ]] || [[ -z "$(ls -A "$SITES_DIR" 2>/dev/null)" ]]; then
     echo ""
@@ -907,8 +1021,8 @@ ui_list() {
   echo "$table_data" | gum table \
     --print \
     --border rounded \
-    --border.foreground 99 \
-    --header.foreground 99 \
+    --border.foreground $GUM_ACCENT \
+    --header.foreground $GUM_ACCENT \
     --header.bold \
     --widths 15,25,20,15
   echo ""
@@ -927,10 +1041,10 @@ ui_wp() {
 
   local action
   action=$(gum choose \
-    --header "$(gum style --foreground 99 --bold '  WP-CLI')" \
+    --header "$(gum style --foreground $GUM_ACCENT --bold '  WP-CLI')" \
     --cursor "▸ " --height 15 \
-    --cursor.foreground 99 \
-    --selected.foreground 99 \
+    --cursor.foreground $GUM_ACCENT \
+    --selected.foreground $GUM_ACCENT \
     "📋  Plugin list" \
     "📥  Plugin install" \
     "🗑️  Plugin deactivate" \
@@ -980,7 +1094,7 @@ ui_wp() {
       [[ -z "$username" ]] && { warn "No username entered."; return; }
       read -rp "Email: " email
       [[ -z "$email" ]] && { warn "No email entered."; return; }
-      role=$(gum choose --header "Role" --cursor "▸ " --cursor.foreground 99 \
+      role=$(gum choose --header "Role" --cursor "▸ " --cursor.foreground $GUM_ACCENT \
         "administrator" "editor" "author" "contributor" "subscriber") || return
       cmd_wp "$name" user create "$username" "$email" --role="$role"
       ;;
@@ -1071,7 +1185,7 @@ ui_db_shell() {
   done
 
   local selected
-  selected=$(gum choose --header "Database shell for which site?" --cursor "▸ " --cursor.foreground 99 "${sites[@]}") || return
+  selected=$(gum choose --header "Database shell for which site?" --cursor "▸ " --cursor.foreground $GUM_ACCENT "${sites[@]}") || return
 
   echo ""
   log "Opening MySQL shell. Type 'exit' to return to iota."
@@ -1109,7 +1223,7 @@ cmd_ui() {
 
   clear
   gum style \
-    --foreground 99 --border-foreground 99 \
+    --foreground $GUM_ACCENT --border-foreground $GUM_ACCENT \
     --border double --align center \
     --width 50 --margin "1 0" --padding "1 2" \
     '⚡ iota' 'Local WordPress Development'
@@ -1118,26 +1232,29 @@ cmd_ui() {
     echo ""
     local choice
     choice=$(gum choose \
-      --header "$(gum style --foreground 99 --bold '  MAIN MENU')" \
+      --header "$(gum style --foreground $GUM_ACCENT --bold '  MAIN MENU')" \
       --cursor "▸ " --height 20 \
-      --cursor.foreground 99 \
-      --selected.foreground 99 \
+      --cursor.foreground $GUM_ACCENT \
+      --selected.foreground $GUM_ACCENT \
       "🆕  Create a new site" \
-      "▶️  Start a site" \
-      "⏹️  Stop a site" \
-      "🗑️  Destroy a site" \
+      "🚀  Start a site" \
+      "🛑  Stop a site" \
+      "💥  Destroy a site" \
       "📋  List all sites" \
+      "📌  Site info" \
       "🌐  Open site in browser" \
       "📦  Run Composer install" \
-      "⚙️  Run WP-CLI command" \
+      "🔧  Run WP-CLI command" \
       "📥  Import database" \
       "📤  Export database" \
       "🐚  Open database shell" \
+      "🔍  Open database tool" \
       "💻  Open site shell" \
       "📜  Tail site logs" \
       "🟢  Start shared services" \
       "🔴  Stop shared services" \
       "📊  Show services status" \
+      "🌍  View hosts file" \
       "📖  View README" \
       "👋  Exit") || break
 
@@ -1147,17 +1264,20 @@ cmd_ui() {
       *"Stop a site")            ui_stop ;;
       *"Destroy a site")         ui_destroy ;;
       *"List all sites")         ui_list; ui_pause ;;
+      *"Site info")              ui_info ;;
       *"Open site in browser")   ui_open ;;
       *"Run Composer install")   ui_compose ;;
       *"Run WP-CLI command")     ui_wp ;;
       *"Import database")        ui_db_import ;;
       *"Export database")        ui_db_export ;;
       *"Open database shell")    ui_db_shell ;;
+      *"Open database tool")     cmd_db_open ;;
       *"Open site shell")        ui_shell ;;
       *"Tail site logs")         ui_logs ;;
       *"Start shared services")  cmd_services_start; ui_pause ;;
       *"Stop shared services")   cmd_services_stop; ui_pause ;;
       *"Show services status")   cmd_services_status; ui_pause ;;
+      *"View hosts file")        cmd_hosts; ui_pause ;;
       *"View README")            glow -p "$SCRIPT_DIR/README.md" ;;
       *"Exit")                   break ;;
       "")                        break ;;
@@ -1166,7 +1286,7 @@ cmd_ui() {
   done
 
   echo ""
-  gum style --foreground 99 "👋 Goodbye!"
+  gum style --foreground $GUM_ACCENT "👋 Goodbye!"
 }
 
 # ─── Router ───────────────────────────────────────────────────────────────────
@@ -1182,13 +1302,16 @@ main() {
     destroy)   cmd_destroy "$@" ;;
     list)      cmd_list ;;
     compose)   cmd_compose "$@" ;;
+    db:open)   cmd_db_open ;;
     db:import) cmd_db_import "$@" ;;
     db:export) cmd_db_export "$@" ;;
     db:shell)  cmd_db_shell "$@" ;;
     shell)     cmd_shell "$@" ;;
     logs)      cmd_logs "$@" ;;
     open)      cmd_open "$@" ;;
+    info)      cmd_info "$@" ;;
     wp)        cmd_wp "$@" ;;
+    hosts)     cmd_hosts ;;
     ui)        cmd_ui ;;
     help|--help|-h) cmd_help ;;
     *) error "Unknown command: $cmd"; cmd_help; exit 1 ;;
