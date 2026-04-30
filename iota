@@ -140,6 +140,12 @@ EOF
     sleep 1
   done
   success "Shared services running"
+  # Warm up Adminer — retry until Traefik has registered the route
+  ( for _ in $(seq 1 15); do
+      curl -skL -o /dev/null --max-time 5 "https://db.local" 2>/dev/null && break
+      sleep 1
+    done
+  ) &
 }
 
 cmd_services_stop() {

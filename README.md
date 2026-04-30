@@ -118,9 +118,9 @@ Then run `iota compose mysite` again to install them.
 
 | Command | Description |
 |---|---|
-| `iota services:start` | Start shared services — runs automatically via `create` and `start` |
+| `iota services:start` | Start shared services (MySQL, Traefik, Adminer) — runs automatically via `create` and `start` |
 | `iota services:stop` | Stop shared services |
-| `iota services:status` | Show running status of MySQL and Traefik |
+| `iota services:status` | Show running status of MySQL, Traefik, and Adminer |
 
 ### Site Management
 
@@ -142,6 +142,7 @@ Then run `iota compose mysite` again to install them.
 
 | Command | Description |
 |---|---|
+| `iota db:open` | Open the database tool ([https://db.local](https://db.local)) in your browser |
 | `iota db:import <name> <file>` | Import a `.sql` or `.sql.gz` dump |
 | `iota db:export <name> [file]` | Export the database to a `.sql` file |
 | `iota db:shell <name>` | Open a MySQL shell scoped to a site's DB |
@@ -150,10 +151,13 @@ Then run `iota compose mysite` again to install them.
 
 | Command | Description |
 |---|---|
+| `iota info <name>` | Show site config (domain, DB credentials, paths, status) |
 | `iota wp <name> [args...]` | Run a WP-CLI command in the container |
 | `iota shell <name>` | Open a bash shell in the WordPress container |
 | `iota logs <name>` | Tail logs for a site |
 | `iota open <name>` | Open the site in your default browser |
+| `iota hosts` | Show the hosts file with iota entries highlighted |
+| `iota ui` | Interactive TUI (requires [gum](https://github.com/charmbracelet/gum)) |
 
 ---
 
@@ -186,10 +190,11 @@ Built automatically on first `iota start`. Shared across all sites.
 
 ### Shared services
 
-`services/docker-compose.yml` runs two shared services:
+`services/docker-compose.yml` runs three shared services:
 
 - **MySQL** (`iota_mysql`) — shared across all sites, exposed on `127.0.0.1:3306`
 - **Traefik** (`iota_traefik`) — reverse proxy, listens on `127.0.0.1:80` and `:443`. Terminates SSL and routes by `Host()` header to the correct WordPress container. HTTP auto-redirects to HTTPS.
+- **Adminer** (`iota_adminer`) — database management tool at [https://db.local](https://db.local). Auto-logs in with root credentials. All site databases are visible.
 
 S3/MinIO and Mailpit are stubbed out — uncomment to enable.
 
@@ -199,8 +204,12 @@ S3/MinIO and Mailpit are stubbed out — uncomment to enable.
 iota/
 ├── Dockerfile                   ← shared PHP/Apache image
 ├── services/
-│   ├── docker-compose.yml       ← shared MySQL + Traefik + optional services
+│   ├── docker-compose.yml       ← shared MySQL + Traefik + Adminer + optional services
+│   ├── adminer/
+│   │   └── index.php            ← custom Adminer entry point (auto-login)
+│   ├── certs/                   ← Adminer TLS cert for db.local (auto-generated)
 │   └── traefik/
+│       ├── adminer.yml          ← Adminer TLS config
 │       └── <name>.yml           ← per-site TLS cert config (auto-generated)
 └── sites/
     └── mysite/
@@ -251,7 +260,9 @@ Uncomment MinIO, Mailpit, or Redis in `services/docker-compose.yml` and run `iot
 
 ## Tips
 
-- **Database GUI:** connect TablePlus or Sequel Pro once to `127.0.0.1:3306` — every site's database is visible. Root credentials are in `services/docker-compose.yml`.
+- **Database tool:** `iota db:open` or visit [https://db.local](https://db.local) — auto-logs in and shows all site databases. Use `iota info mysite` to see the DB credentials for a specific site.
+- **External database GUI:** connect TablePlus or Sequel Pro to `127.0.0.1:3306` — every site's database is visible. Root credentials are in `services/docker-compose.yml`.
 - **Updating a plugin:** bump the version in `composer.json` and run `iota compose mysite` again.
 - **WP-CLI:** `iota wp mysite plugin list`, `iota wp mysite cache flush`, etc.
 - **First start is slow:** Docker builds the image from scratch. Subsequent starts use the cache and are fast.
+- **Interactive mode:** `iota ui` launches a TUI with all commands (requires `brew install gum`).

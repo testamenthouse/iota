@@ -269,9 +269,9 @@
     <div class="cmd-group">
       <h3>Shared services</h3>
       <table class="cmd-table">
-        <tr><td><code>iota services:start</code></td><td>Start shared services (MySQL + Traefik) &mdash; runs automatically via <code>create</code> and <code>start</code></td></tr>
+        <tr><td><code>iota services:start</code></td><td>Start shared services (MySQL, Traefik, Adminer) &mdash; runs automatically via <code>create</code> and <code>start</code></td></tr>
         <tr><td><code>iota services:stop</code></td><td>Stop shared services</td></tr>
-        <tr><td><code>iota services:status</code></td><td>Show running status of MySQL and Traefik</td></tr>
+        <tr><td><code>iota services:status</code></td><td>Show running status of MySQL, Traefik, and Adminer</td></tr>
       </table>
     </div>
 
@@ -296,6 +296,7 @@
     <div class="cmd-group">
       <h3>Database</h3>
       <table class="cmd-table">
+        <tr><td><code>iota db:open</code></td><td>Open the database tool (<code>https://db.local</code>) in your browser</td></tr>
         <tr><td><code>iota db:import &lt;name&gt; &lt;file&gt;</code></td><td>Import a <code>.sql</code> or <code>.sql.gz</code> file</td></tr>
         <tr><td><code>iota db:export &lt;name&gt; [file]</code></td><td>Dump the database to a <code>.sql</code> file</td></tr>
         <tr><td><code>iota db:shell &lt;name&gt;</code></td><td>Open a MySQL shell scoped to a site's database</td></tr>
@@ -305,10 +306,13 @@
     <div class="cmd-group">
       <h3>Tools</h3>
       <table class="cmd-table">
+        <tr><td><code>iota info &lt;name&gt;</code></td><td>Show site config (domain, DB credentials, paths, status)</td></tr>
         <tr><td><code>iota wp &lt;name&gt; [args...]</code></td><td>Run a WP-CLI command inside the container</td></tr>
         <tr><td><code>iota shell &lt;name&gt;</code></td><td>Open a bash shell in the WordPress container</td></tr>
         <tr><td><code>iota logs &lt;name&gt;</code></td><td>Tail logs for a site</td></tr>
         <tr><td><code>iota open &lt;name&gt;</code></td><td>Open the site in your default browser</td></tr>
+        <tr><td><code>iota hosts</code></td><td>Show the hosts file with iota entries highlighted</td></tr>
+        <tr><td><code>iota ui</code></td><td>Interactive TUI (requires <code>gum</code>)</td></tr>
       </table>
     </div>
   </section>
@@ -330,6 +334,10 @@
         <div class="arch-node green">
           <div class="arch-node-name">iota_traefik</div>
           <div class="arch-node-tag">traefik:v3 &middot; 127.0.0.1:443</div>
+        </div>
+        <div class="arch-node green">
+          <div class="arch-node-name">iota_adminer</div>
+          <div class="arch-node-tag">adminer &middot; https://db.local</div>
         </div>
       </div>
       <hr class="arch-divider">
@@ -354,9 +362,13 @@
     <div class="tree"><pre>iota/
 ├── <span class="hl">Dockerfile</span>               <span class="dim">&larr; php:8.2-apache + extensions + Composer + WP-CLI</span>
 ├── services/
-│   ├── <span class="hl">docker-compose.yml</span>   <span class="dim">&larr; shared MySQL + Traefik + optional S3, Mailpit</span>
-│   └── traefik/             <span class="dim">&larr; per-site TLS cert configs (auto-generated)</span>
-│       └── &lt;name&gt;.yml
+│   ├── <span class="hl">docker-compose.yml</span>   <span class="dim">&larr; shared MySQL + Traefik + Adminer + optional S3, Mailpit</span>
+│   ├── adminer/
+│   │   └── <span class="hl">index.php</span>        <span class="dim">&larr; custom Adminer entry point (auto-login)</span>
+│   ├── certs/               <span class="dim">&larr; Adminer TLS cert for db.local (auto-generated)</span>
+│   └── traefik/             <span class="dim">&larr; TLS cert configs (auto-generated)</span>
+│       ├── adminer.yml      <span class="dim">&larr; Adminer TLS config (db.local)</span>
+│       └── &lt;name&gt;.yml       <span class="dim">&larr; per-site TLS cert config</span>
 └── sites/
     └── mysite/
         ├── .iota                <span class="dim">&larr; credentials, domain, content path</span>
@@ -403,8 +415,8 @@
     <div class="tips">
       <div class="tip">
         <div class="tip-icon">&#x1F5C4;</div>
-        <div class="tip-title">Database GUI</div>
-        <div class="tip-body">Connect TablePlus or Sequel Pro once to <code>127.0.0.1:3306</code> &mdash; every site's database is visible. Root credentials are in <code>services/docker-compose.yml</code>.</div>
+        <div class="tip-title">Database tool</div>
+        <div class="tip-body">Run <code>iota db:open</code> or visit <code>https://db.local</code> &mdash; auto-logs in and shows all site databases. Use <code>iota info mysite</code> to see credentials.</div>
       </div>
       <div class="tip">
         <div class="tip-icon">&#x1F4E6;</div>
@@ -420,6 +432,11 @@
         <div class="tip-icon">&#x1F527;</div>
         <div class="tip-title">WP-CLI</div>
         <div class="tip-body">Run any WP-CLI command: <code>iota wp mysite plugin list</code>, <code>iota wp mysite cache flush</code>, etc.</div>
+      </div>
+      <div class="tip">
+        <div class="tip-icon">&#x1F5A5;</div>
+        <div class="tip-title">Interactive mode</div>
+        <div class="tip-body">Run <code>iota ui</code> for a full TUI with all commands. Requires <code>brew install gum</code>.</div>
       </div>
     </div>
   </section>
