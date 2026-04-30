@@ -35,6 +35,13 @@ require_site() {
   [[ -d "$SITES_DIR/$name" ]] || { error "Site '$name' does not exist. Run: iota create $name"; exit 1; }
 }
 
+require_mysql_running() {
+  if ! docker ps --filter "name=$MYSQL_CONTAINER" --filter "status=running" -q 2>/dev/null | grep -q .; then
+    error "Shared MySQL is not running. Run: iota services:start"
+    return 1
+  fi
+}
+
 sanitize_name() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/^-//;s/-$//'
 }
@@ -52,21 +59,6 @@ get_site_dir() {
 
 list_running() {
   docker ps --filter "label=iota.site" --format "{{.Label \"iota.site\"}}" 2>/dev/null | sort -u
-}
-
-pick_port() {
-  local lo="$1" hi="$2"
-  python3 -c "
-import socket, random
-for _ in range(200):
-    p = random.randint($lo, $hi)
-    s = socket.socket()
-    s.settimeout(0.5)
-    if s.connect_ex(('localhost', p)) != 0:
-        print(p)
-        break
-    s.close()
-"
 }
 
 ensure_mkcert() {
@@ -222,6 +214,12 @@ cmd_create() {
 
   local name; name="$(sanitize_name "$raw_name")"
   [[ -z "$domain" ]] && domain="${name}.local"
+
+  # Validate domain format
+  if [[ ! "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+    error "Invalid domain: '$domain'. Use only letters, numbers, dots, and hyphens."
+    exit 1
+  fi
 
   # Resolve custom_path to absolute
   if [[ -n "$custom_path" ]]; then
@@ -406,8 +404,7 @@ services:
       - ${site_dir}:/var/www/html
       - ${meta_dir}/apache/iota.conf:/etc/apache2/sites-enabled/iota.conf:ro
       - ${meta_dir}/wp-config.php:/var/www/html/public/wp-config.php:ro
-    command: >
-      bash -c "a2enmod rewrite headers alias && apache2-foreground"
+    command: apache2-foreground
     networks:
       - iota_services
     labels:
@@ -417,6 +414,11 @@ services:
       traefik.http.routers.${name}.entrypoints: "websecure"
       traefik.http.routers.${name}.tls: "true"
       traefik.http.services.${name}.loadbalancer.server.port: "80"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   iota_services:
@@ -445,7 +447,14 @@ EOF
 }
 
 cmd_start() {
-  local name="${1:-}"; [[ -z "$name" ]] && { error "Usage: iota start <name>"; exit 1; }
+  local name="" force_build=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --build) force_build=true; shift ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [[ -z "$name" ]] && { error "Usage: iota start <name> [--build]"; exit 1; }
   require_site "$name"
 
   cmd_services_start
@@ -453,8 +462,22 @@ cmd_start() {
   local domain; domain="$(get_site_config "$name" DOMAIN)"
 
   header "Starting $name..."
-  docker compose -f "$SITES_DIR/$name/docker-compose.yml" up -d --build --remove-orphans
+  local build_flag=""
+  if $force_build || ! docker image inspect iota-php:latest &>/dev/null; then
+    build_flag="--build"
+  else
+    log "Image iota-php:latest exists, skipping build. Use --build to force."
+  fi
+  # shellcheck disable=SC2086
+  docker compose -f "$SITES_DIR/$name/docker-compose.yml" up -d $build_flag --remove-orphans
   success "Site running at https://$domain"
+
+  # Warm up opcache and WordPress by hitting the site in the background
+  log "Warming up site..."
+  curl -sk -o /dev/null -w "" "https://$domain/" 2>/dev/null &
+  curl -sk -o /dev/null -w "" "https://$domain/wp-login.php" 2>/dev/null &
+  wait
+  success "Site warmed up"
 }
 
 cmd_stop() {
@@ -505,7 +528,7 @@ cmd_destroy() {
 
   if grep -q "[[:space:]]${domain}" "$HOSTS_FILE" 2>/dev/null; then
     log "Removing $domain from $HOSTS_FILE (requires sudo)..."
-    sudo sed -i.bak "/[[:space:]]${domain}/d" "$HOSTS_FILE"
+    sudo sed -i.bak "\|[[:space:]]${domain}|d" "$HOSTS_FILE"
     success "Removed $domain from hosts file"
   fi
 
@@ -831,7 +854,7 @@ ui_destroy() {
 
   if grep -q "[[:space:]]${domain}" "$HOSTS_FILE" 2>/dev/null; then
     log "Removing $domain from $HOSTS_FILE (requires sudo)..."
-    sudo sed -i.bak "/[[:space:]]${domain}/d" "$HOSTS_FILE"
+    sudo sed -i.bak "\|[[:space:]]${domain}|d" "$HOSTS_FILE"
     success "Removed $domain from hosts file"
   fi
 
@@ -994,16 +1017,16 @@ ui_wp() {
       ;;
     *"Custom command")
       local wp_args
-      read -rp "WP-CLI command: " wp_args
-      [[ -z "$wp_args" ]] && { warn "No command entered."; return; }
-      # shellcheck disable=SC2086
-      cmd_wp "$name" $wp_args
+      read -rp "WP-CLI command: " -a wp_args
+      [[ ${#wp_args[@]} -eq 0 ]] && { warn "No command entered."; return; }
+      cmd_wp "$name" "${wp_args[@]}"
       ;;
   esac
   ui_pause
 }
 
 ui_db_import() {
+  require_mysql_running || return
   local name
   name=$(ui_pick_site "Import database for which site?") || return
   echo "Select the SQL file to import:"
@@ -1011,7 +1034,7 @@ ui_db_import() {
   file=$(cd "$HOME" && gum file --all) || return
   [[ -z "$file" ]] && { warn "No file selected."; return; }
   # Resolve to absolute path since gum file returns relative to $HOME
-  file="$HOME/$file"
+  [[ "$file" = /* ]] || file="$HOME/$file"
   if [[ "$file" != *.sql && "$file" != *.sql.gz ]]; then
     warn "File must be .sql or .sql.gz"
     ui_pause
@@ -1023,6 +1046,7 @@ ui_db_import() {
 }
 
 ui_db_export() {
+  require_mysql_running || return
   local name
   name=$(ui_pick_site "Export database for which site?") || return
   local export_dir="$SITES_DIR/$name/exports"

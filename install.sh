@@ -97,7 +97,6 @@ banner
 section "Required"
 check_dep docker   "Install Docker Desktop: https://docs.docker.com/desktop/"
 check_dep openssl  "Install via: brew install openssl"
-check_dep python3  "Install via: brew install python3"
 check_dep mkcert   "Install via: brew install mkcert"
 
 section "Optional (for iota ui)"
@@ -116,11 +115,7 @@ fi
 section "CLI Setup"
 chmod +x "$SCRIPT_DIR/iota"
 
-if [[ -L "$INSTALL_LINK" ]] || [[ -f "$INSTALL_LINK" ]]; then
-  sudo rm -f "$INSTALL_LINK"
-fi
-
-sudo ln -sf "$SCRIPT_DIR/iota" "$INSTALL_LINK"
+sudo ln -sfn "$SCRIPT_DIR/iota" "$INSTALL_LINK"
 ok "Symlink ${DIM}$INSTALL_LINK → $SCRIPT_DIR/iota${RESET}"
 
 mkdir -p "$SCRIPT_DIR/sites"

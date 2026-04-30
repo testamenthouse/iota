@@ -22,6 +22,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   traefik:
     image: traefik:v3
@@ -37,6 +42,7 @@ services:
       - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
       - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
       - "--entrypoints.websecure.address=:443"
+      - "--ping=true"
     ports:
       - "127.0.0.1:80:80"
       - "127.0.0.1:443:443"
@@ -46,6 +52,16 @@ services:
       - ../sites:/sites:ro
     networks:
       - iota_services
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     labels:
       iota.service: traefik
 
