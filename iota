@@ -1308,31 +1308,37 @@ cmd_ui() {
     local choice
     choice=$(gum choose \
       --header "$(gum style --foreground $GUM_ACCENT --bold '  MAIN MENU')" \
-      --cursor "▸ " --height 23 \
+      --cursor "▸ " --height 28 \
       --cursor.foreground $GUM_ACCENT \
       --selected.foreground $GUM_ACCENT \
-      "🆕  Create a new site" \
-      "🚀  Start a site" \
-      "🛑  Stop a site" \
-      "💥  Destroy a site" \
-      "📋  List all sites" \
-      "📌  Site info" \
-      "🌐  Open site in browser" \
-      "📦  Run Composer install" \
-      "🔧  Run WP-CLI command" \
-      "📥  Import database" \
-      "📤  Export database" \
-      "🐚  Open database shell" \
-      "🔍  Open database tool" \
-      "💻  Open site shell" \
-      "📜  Tail site logs" \
-      "🟢  Start shared services" \
-      "🔴  Stop shared services" \
-      "📊  Show services status" \
-      "🌍  View hosts file" \
-      "📖  View README" \
-      "🗑️   Uninstall iota" \
-      "👋  Exit") || break
+      --selected "  🆕  Create a new site" \
+      "── Sites ──────────────────" \
+      "  🆕  Create a new site" \
+      "  🚀  Start a site" \
+      "  🛑  Stop a site" \
+      "  💥  Destroy a site" \
+      "  📋  List all sites" \
+      "  📌  Site info" \
+      "  🌐  Open in browser" \
+      "── Tools ──────────────────" \
+      "  📦  Run Composer install" \
+      "  🔧  Run WP-CLI command" \
+      "  💻  Open site shell" \
+      "  📜  Tail site logs" \
+      "── Database ───────────────" \
+      "  📥  Import database" \
+      "  📤  Export database" \
+      "  🐚  Open database shell" \
+      "  🔍  Open database tool" \
+      "── Services ───────────────" \
+      "  🟢  Start shared services" \
+      "  🔴  Stop shared services" \
+      "  📊  Show services status" \
+      "── Other ──────────────────" \
+      "  🌍  View hosts file" \
+      "  📖  View README" \
+      "  🗑️   Uninstall iota" \
+      "  👋  Exit") || break
 
     case "$choice" in
       *"Create a new site")      ui_create ;;
@@ -1341,7 +1347,7 @@ cmd_ui() {
       *"Destroy a site")         ui_destroy ;;
       *"List all sites")         ui_list; ui_pause ;;
       *"Site info")              ui_info ;;
-      *"Open site in browser")   ui_open ;;
+      *"Open in browser")        ui_open ;;
       *"Run Composer install")   ui_compose ;;
       *"Run WP-CLI command")     ui_wp ;;
       *"Import database")        ui_db_import ;;
