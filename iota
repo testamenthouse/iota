@@ -785,7 +785,7 @@ ui_start() {
 
 ui_stop() {
   local name
-  name=$(ui_pick_site "Stop which site?") || return
+  name=$(ui_pick_running_site "Stop which site?") || return
   cmd_stop "$name"
   ui_pause
 }
@@ -893,14 +893,14 @@ ui_list() {
 
 ui_compose() {
   local name
-  name=$(ui_pick_site "Run Composer for which site?") || return
+  name=$(ui_pick_running_site "Run Composer for which site?") || return
   cmd_compose "$name"
   ui_pause
 }
 
 ui_wp() {
   local name
-  name=$(ui_pick_site "Run WP-CLI for which site?") || return
+  name=$(ui_pick_running_site "Run WP-CLI for which site?") || return
 
   local action
   action=$(gum choose \
