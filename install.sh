@@ -3,72 +3,150 @@
 
 set -euo pipefail
 
+# Ensure Homebrew is in PATH (macOS)
+[[ -d /opt/homebrew/bin ]] && export PATH="/opt/homebrew/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_LINK="/usr/local/bin/iota"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+# Force color output from gum even inside $() subshells
+export CLICOLOR_FORCE=1
 
-log()    { echo -e "${CYAN}[install]${RESET} $*"; }
-success(){ echo -e "${GREEN}[✓]${RESET} $*"; }
-warn()   { echo -e "${YELLOW}[!]${RESET} $*"; }
-error()  { echo -e "${RED}[✗]${RESET} $*" >&2; }
+# ── Colors ────────────────────────────────────────────────────────────────────
+PINK='\033[38;5;212m'
+GREEN='\033[38;5;120m'
+RED='\033[38;5;203m'
+YELLOW='\033[38;5;221m'
+DIM='\033[2m'
+BOLD='\033[1m'
+RESET='\033[0m'
 
-echo ""
-echo -e "${BOLD}iota installer${RESET}"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+HAS_GUM=false
+command -v gum &>/dev/null && HAS_GUM=true
 
+# ── Styled output ────────────────────────────────────────────────────────────
+banner() {
+  echo ""
+  if $HAS_GUM; then
+    gum style \
+      --foreground 212 --border-foreground 212 \
+      --border double --align center \
+      --width 50 --margin "0 0" --padding "1 2" \
+      '⚡ iota' 'installer'
+  else
+    echo -e "${PINK}╔══════════════════════════════════════════════════╗${RESET}"
+    echo -e "${PINK}║                                                  ║${RESET}"
+    echo -e "${PINK}║${RESET}               ${PINK}${BOLD}⚡ iota${RESET}                            ${PINK}║${RESET}"
+    echo -e "${PINK}║${RESET}              ${PINK}installer${RESET}                           ${PINK}║${RESET}"
+    echo -e "${PINK}║                                                  ║${RESET}"
+    echo -e "${PINK}╚══════════════════════════════════════════════════╝${RESET}"
+  fi
+  echo ""
+}
+
+section() {
+  echo ""
+  if $HAS_GUM; then
+    gum style --foreground 212 --bold --border rounded --border-foreground 240 \
+      --padding "0 1" --margin "0 1" "$1"
+  else
+    echo -e "  ${PINK}${BOLD}$1${RESET}"
+    echo -e "  ${DIM}$(printf '%.0s─' {1..46})${RESET}"
+  fi
+}
+
+ok()   { echo -e "  ${GREEN}✓${RESET}  $*"; }
+fail() { echo -e "  ${RED}✗${RESET}  $*" >&2; }
+info() { echo -e "  ${PINK}→${RESET}  $*"; }
+skip() { echo -e "  ${YELLOW}○${RESET}  $*"; }
+
+# ── Dependency checks ────────────────────────────────────────────────────────
 check_dep() {
   local bin="$1" install_hint="$2"
   if command -v "$bin" &>/dev/null; then
-    success "$bin found ($(command -v "$bin"))"
+    ok "${BOLD}$bin${RESET} ${DIM}$(command -v "$bin")${RESET}"
   else
-    error "$bin not found. $install_hint"
+    fail "${BOLD}$bin${RESET} not found"
+    echo -e "     ${DIM}$install_hint${RESET}"
     exit 1
   fi
 }
 
-log "Checking dependencies..."
+check_optional() {
+  local bin="$1" install_cmd="$2" purpose="$3"
+  if command -v "$bin" &>/dev/null; then
+    ok "${BOLD}$bin${RESET} ${DIM}$(command -v "$bin")${RESET}"
+  else
+    skip "${BOLD}$bin${RESET} ${DIM}— $purpose${RESET}"
+    if command -v brew &>/dev/null; then
+      read -rp "     Install now with Homebrew? [y/N] " yn
+      if [[ "$yn" =~ ^[Yy]$ ]]; then
+        brew install "$install_cmd"
+        ok "${BOLD}$bin${RESET} installed"
+        [[ "$bin" == "gum" ]] && HAS_GUM=true
+      fi
+    else
+      echo -e "     ${DIM}Install via: brew install $install_cmd${RESET}"
+    fi
+  fi
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+banner
+
+section "Required"
 check_dep docker   "Install Docker Desktop: https://docs.docker.com/desktop/"
 check_dep openssl  "Install via: brew install openssl"
 check_dep python3  "Install via: brew install python3"
-check_dep mkcert   "Install via: brew install mkcert  (then re-run this installer)"
+check_dep mkcert   "Install via: brew install mkcert"
 
-# Ensure mkcert local CA is trusted by browsers/system
-log "Ensuring mkcert local CA is installed in system trust store..."
+section "Optional (for iota ui)"
+check_optional gum  gum  "interactive TUI"
+check_optional glow glow "README viewer"
+
+section "SSL Certificate Authority"
 if mkcert -CAROOT &>/dev/null 2>&1; then
-  success "mkcert CA already installed"
+  ok "mkcert CA trusted by system"
 else
-  log "Installing mkcert CA (requires sudo — this lets your browser trust local certs)..."
+  info "Installing mkcert CA (requires sudo)..."
   mkcert -install
-  success "mkcert CA installed"
+  ok "mkcert CA installed"
 fi
 
-# Make scripts executable
+section "CLI Setup"
 chmod +x "$SCRIPT_DIR/iota"
 
-# Create symlink
 if [[ -L "$INSTALL_LINK" ]] || [[ -f "$INSTALL_LINK" ]]; then
-  warn "Removing existing $INSTALL_LINK..."
   sudo rm -f "$INSTALL_LINK"
 fi
 
-log "Creating symlink at $INSTALL_LINK (requires sudo)..."
 sudo ln -sf "$SCRIPT_DIR/iota" "$INSTALL_LINK"
-success "Symlink created: $INSTALL_LINK → $SCRIPT_DIR/iota"
+ok "Symlink ${DIM}$INSTALL_LINK → $SCRIPT_DIR/iota${RESET}"
 
-# Ensure sites dir exists
 mkdir -p "$SCRIPT_DIR/sites"
-success "Sites directory ready: $SCRIPT_DIR/sites"
+ok "Sites directory ${DIM}$SCRIPT_DIR/sites${RESET}"
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+echo ""
+if $HAS_GUM; then
+  gum style \
+    --foreground 120 --border-foreground 120 \
+    --border rounded --align center \
+    --width 50 --padding "1 2" \
+    '✓ Installation complete!'
+  echo ""
+  gum style --foreground 212 --bold --margin "0 1" "Get started"
+else
+  echo -e "  ${GREEN}${BOLD}✓ Installation complete!${RESET}"
+  echo ""
+  echo -e "  ${PINK}${BOLD}Get started${RESET}"
+fi
 
 echo ""
-echo -e "${GREEN}${BOLD}Installation complete!${RESET}"
+echo -e "  ${PINK}iota create mysite mysite.local${RESET}"
+echo -e "  ${PINK}iota start mysite${RESET}"
+echo -e "  ${DIM}  → https://mysite.local  (trusted SSL)${RESET}"
 echo ""
-echo -e "Get started:"
-echo -e "  ${CYAN}iota create mysite mysite.local${RESET}"
-echo -e "  ${CYAN}iota start mysite${RESET}"
-echo -e "  # → https://mysite.local  (trusted SSL, no browser warnings)"
-echo -e ""
-echo -e "  ${CYAN}iota list${RESET}"
-echo -e "  ${CYAN}iota help${RESET}"
+echo -e "  ${PINK}iota ui${RESET}    ${DIM}interactive mode${RESET}"
+echo -e "  ${PINK}iota help${RESET}  ${DIM}all commands${RESET}"
 echo ""

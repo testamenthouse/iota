@@ -1,5 +1,3 @@
-version: '3.8'
-
 # ── iota shared services ──────────────────────────────────────────────────────
 # One MySQL instance shared across all sites. Each site gets its own database
 # and user. Add future shared services (S3, Mailpit, Redis, etc.) here.

@@ -3,6 +3,8 @@
 # Usage: iota <command> [options]
 
 set -euo pipefail
+export DOCKER_CLI_HINTS=false
+export CLICOLOR_FORCE=1
 
 # Resolve symlinks so SCRIPT_DIR always points to the actual repo, not /usr/local/bin
 _SOURCE="${BASH_SOURCE[0]}"
@@ -77,6 +79,24 @@ ensure_mkcert() {
   mkcert -install 2>/dev/null || true
 }
 
+ensure_gum() {
+  if ! command -v gum &>/dev/null; then
+    error "gum is not installed."
+    if command -v brew &>/dev/null; then
+      echo "  Install:  brew install gum"
+      read -rp "Install now with Homebrew? [y/N] " install_now
+      if [[ "$install_now" =~ ^[Yy]$ ]]; then
+        brew install gum
+      else
+        exit 1
+      fi
+    else
+      echo "  Install:  https://github.com/charmbracelet/gum#installation"
+      exit 1
+    fi
+  fi
+}
+
 # ── Shared services ────────────────────────────────────────────────────────────
 
 services_running() {
@@ -132,6 +152,7 @@ ensure_site_db() {
   mysql_exec <<SQL
 CREATE DATABASE IF NOT EXISTS \`${db_name}\`;
 CREATE USER IF NOT EXISTS '${db_user}'@'%' IDENTIFIED BY '${db_pass}';
+ALTER USER '${db_user}'@'%' IDENTIFIED BY '${db_pass}';
 GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'%';
 FLUSH PRIVILEGES;
 SQL
@@ -173,6 +194,7 @@ cmd_help() {
   printf "  logs   <name>             Tail logs for a site\n"
   printf "  open   <name>             Open site in your default browser\n"
   printf "  wp     <name> [args...]   Run WP-CLI command inside container\n"
+  printf "  ui                        Interactive TUI (requires gum)\n"
   printf "\n${BOLD}COMPOSER WORKFLOW${RESET}\n"
   printf "  1. iota create mysite mysite.local\n"
   printf "  2. Drop composer.json into sites/mysite/\n"
@@ -370,8 +392,6 @@ EOF
   #   site_dir  → /var/www/html  (WordPress content: composer.json, public/, vendor/)
   #   meta_dir  → conf files mounted individually (apache conf, wp-config)
   cat > "$meta_dir/docker-compose.yml" << EOF
-version: '3.8'
-
 services:
   wordpress:
     build:
@@ -549,7 +569,8 @@ cmd_compose() {
     "type": "project",
     "require": {
         "composer/installers": "^2.2",
-        "johnpbloch/wordpress": "^6.3.0"
+        "johnpbloch/wordpress": "^6.3.0",
+        "wpackagist-theme/twentytwentyfive": "^1.0"
     },
     "config": {
         "allow-plugins": {
@@ -588,8 +609,14 @@ COMPOSEREOF
     exit 1
   fi
 
-  header "Running composer install for $name..."
-  docker exec -it "${name}_wordpress" bash -c "cd /var/www/html && composer install --no-interaction --prefer-dist"
+  # Use "composer update" when lock file is missing or stale, otherwise "install"
+  local composer_cmd="install"
+  if [[ ! -f "$site_dir/composer.lock" || "$site_dir/composer.json" -nt "$site_dir/composer.lock" ]]; then
+    composer_cmd="update"
+  fi
+
+  header "Running composer $composer_cmd for $name..."
+  docker exec -it "${name}_wordpress" bash -c "cd /var/www/html && COMPOSER_FUND=0 composer $composer_cmd --no-interaction --prefer-dist"
   success "Composer install complete"
   echo ""
   echo -e "  WordPress core: ${CYAN}${site_dir}/public/wp/${RESET}"
@@ -630,6 +657,14 @@ cmd_db_export() {
   header "Exporting database from $name ($db_name)..."
   docker exec "$MYSQL_CONTAINER" mysqldump -uroot -p"$MYSQL_ROOT_PASS" "$db_name" > "$outfile"
   success "Exported to $outfile"
+
+  local export_dir
+  export_dir="$(cd "$(dirname "$outfile")" && pwd)"
+  printf "\n"
+  read -rp "Open exports folder? [y/N] " answer
+  if [[ "$answer" =~ ^[Yy]$ ]]; then
+    open "$export_dir"
+  fi
 }
 
 cmd_db_shell() {
@@ -672,6 +707,444 @@ cmd_wp() {
   docker exec -it "${name}_wordpress" wp --allow-root --path=/var/www/html/public/wp "$@"
 }
 
+# ─── TUI (requires gum) ───────────────────────────────────────────────────────
+
+ui_pause() {
+  echo ""
+  read -rp "Press Enter to continue..."
+}
+
+ui_pick_site() {
+  local header="${1:-Choose a site}"
+  local sites=()
+  for d in "$SITES_DIR"/*/; do
+    [[ -f "$d/.iota" ]] || continue
+    local site_name; site_name="$(basename "$d")"
+    local domain; domain="$(get_site_config "$site_name" DOMAIN)"
+    local status="⏹"
+    if docker ps --filter "name=${site_name}_wordpress" --filter "status=running" -q 2>/dev/null | grep -q .; then
+      status="🟢"
+    fi
+    sites+=("$status  $site_name ($domain)")
+  done
+  if [[ ${#sites[@]} -eq 0 ]]; then
+    error "No sites found. Create one first."
+    return 1
+  fi
+  local selected
+  selected=$(gum choose --header "$header" --cursor "▸ " --cursor.foreground 99 "${sites[@]}") || return 1
+  # Extract site name from "🟢  name (domain)" format
+  echo "$selected" | sed 's/^[^ ]*  //' | sed 's/ (.*//'
+}
+
+ui_pick_running_site() {
+  local header="${1:-Choose a running site}"
+  local sites=()
+  for d in "$SITES_DIR"/*/; do
+    [[ -f "$d/.iota" ]] || continue
+    local site_name; site_name="$(basename "$d")"
+    if docker ps --filter "name=${site_name}_wordpress" --filter "status=running" -q 2>/dev/null | grep -q .; then
+      local domain; domain="$(get_site_config "$site_name" DOMAIN)"
+      sites+=("🟢  $site_name ($domain)")
+    fi
+  done
+  if [[ ${#sites[@]} -eq 0 ]]; then
+    error "No running sites. Start one first."
+    return 1
+  fi
+  local selected
+  selected=$(gum choose --header "$header" --cursor "▸ " --cursor.foreground 99 "${sites[@]}") || return 1
+  echo "$selected" | sed 's/^[^ ]*  //' | sed 's/ (.*//'
+}
+
+ui_create() {
+  header "Create a new site"
+  local name domain
+  read -rp "Site name: " name
+  [[ -z "$name" ]] && { warn "No name entered."; return; }
+
+  read -rp "Domain [${name}.local]: " domain
+  domain="${domain:-${name}.local}"
+
+  if gum confirm "Use a custom path for site files?" --default=false; then
+    local custom_path
+    custom_path=$(gum file --directory) || return
+    cmd_create "$name" "$domain" --path "$custom_path"
+  else
+    cmd_create "$name" "$domain"
+  fi
+  ui_pause
+}
+
+ui_start() {
+  local name
+  name=$(ui_pick_site "Start which site?") || return
+  cmd_start "$name"
+  ui_pause
+}
+
+ui_stop() {
+  local name
+  name=$(ui_pick_site "Stop which site?") || return
+  cmd_stop "$name"
+  ui_pause
+}
+
+ui_destroy() {
+  local name
+  name=$(ui_pick_site "Destroy which site?") || return
+
+  local domain; domain="$(get_site_config "$name" DOMAIN)"
+  local db_name; db_name="$(get_site_config "$name" DB_NAME)"
+  local db_user; db_user="$(get_site_config "$name" DB_USER)"
+
+  warn "This will permanently delete site '$name' ($domain), its database, and SSL certs."
+
+  local confirm_name
+  read -rp "Type '$name' to confirm: " confirm_name
+  [[ "$confirm_name" != "$name" ]] && { error "Name mismatch. Aborted."; ui_pause; return; }
+
+  local custom_path is_custom=false
+  custom_path="$(get_site_config "$name" SITE_PATH)"
+  if [[ -n "$custom_path" && "$custom_path" != "$SITES_DIR/$name" ]]; then
+    is_custom=true
+  fi
+
+  local delete_meta=false
+  if $is_custom; then
+    warn "Custom-path site — your files at '$custom_path' will NOT be touched."
+    gum confirm "Delete iota resources at sites/$name/?" --default=false && delete_meta=true
+  else
+    gum confirm "Also delete the site files at sites/$name/?" --default=false && delete_meta=true
+  fi
+
+  header "Destroying $name..."
+  docker compose -f "$SITES_DIR/$name/docker-compose.yml" down --remove-orphans 2>/dev/null || true
+
+  if docker ps --filter "name=$MYSQL_CONTAINER" --filter "status=running" -q 2>/dev/null | grep -q .; then
+    log "Dropping database '$db_name'..."
+    drop_site_db "$db_name" "$db_user"
+    success "Database dropped"
+  else
+    warn "Shared MySQL not running — skipping DB drop."
+  fi
+
+  if grep -q "[[:space:]]${domain}" "$HOSTS_FILE" 2>/dev/null; then
+    log "Removing $domain from $HOSTS_FILE (requires sudo)..."
+    sudo sed -i.bak "/[[:space:]]${domain}/d" "$HOSTS_FILE"
+    success "Removed $domain from hosts file"
+  fi
+
+  rm -f "$SERVICES_DIR/traefik/${name}.yml"
+
+  if $delete_meta; then
+    rm -rf "$SITES_DIR/$name"
+    success "Destroyed site '$name' (iota resources deleted)"
+  else
+    success "Destroyed site '$name' (iota resources kept at sites/$name/)"
+  fi
+  ui_pause
+}
+
+ui_open() {
+  local name
+  name=$(ui_pick_running_site "Open which site?") || return
+  cmd_open "$name"
+}
+
+ui_list() {
+  local running_sites; running_sites="$(list_running)"
+
+  # Services status
+  local mysql_status="🔴 stopped"
+  if services_running; then
+    mysql_status="🟢 running → 127.0.0.1:3306"
+  fi
+  gum style --foreground 99 --bold --margin "0 1" "Shared MySQL: $mysql_status"
+
+  if [[ ! -d "$SITES_DIR" ]] || [[ -z "$(ls -A "$SITES_DIR" 2>/dev/null)" ]]; then
+    echo ""
+    warn "No sites yet. Run: iota create <name>"
+    return
+  fi
+
+  # Build CSV for gum table
+  local table_data="NAME,DOMAIN,DATABASE,STATUS"
+  for site_dir in "$SITES_DIR"/*/; do
+    [[ -f "$site_dir/.iota" ]] || continue
+    local sname; sname="$(basename "$site_dir")"
+    local domain; domain="$(get_site_config "$sname" DOMAIN)"
+    local db_name; db_name="$(get_site_config "$sname" DB_NAME)"
+    local status="⏹  stopped"
+    echo "$running_sites" | grep -q "^${sname}$" && status="🟢 running"
+    table_data+=$'\n'"$sname,$domain,$db_name,$status"
+  done
+
+  echo ""
+  echo "$table_data" | gum table \
+    --print \
+    --border rounded \
+    --border.foreground 99 \
+    --header.foreground 99 \
+    --header.bold \
+    --widths 15,25,20,15
+  echo ""
+}
+
+ui_compose() {
+  local name
+  name=$(ui_pick_site "Run Composer for which site?") || return
+  cmd_compose "$name"
+  ui_pause
+}
+
+ui_wp() {
+  local name
+  name=$(ui_pick_site "Run WP-CLI for which site?") || return
+
+  local action
+  action=$(gum choose \
+    --header "$(gum style --foreground 99 --bold '  WP-CLI')" \
+    --cursor "▸ " --height 15 \
+    --cursor.foreground 99 \
+    --selected.foreground 99 \
+    "📋  Plugin list" \
+    "📥  Plugin install" \
+    "🗑️  Plugin deactivate" \
+    "🎨  Theme list" \
+    "🎨  Theme activate" \
+    "👤  User list" \
+    "👤  Create user" \
+    "🔗  Option get" \
+    "🔗  Option update" \
+    "🔄  Search-replace" \
+    "🗄️  Cache flush" \
+    "📝  Custom command") || return
+
+  case "$action" in
+    *"Plugin list")
+      cmd_wp "$name" plugin list
+      ;;
+    *"Plugin install")
+      local slug
+      read -rp "Plugin slug: " slug
+      [[ -z "$slug" ]] && { warn "No slug entered."; return; }
+      cmd_wp "$name" plugin install "$slug" --activate
+      ;;
+    *"Plugin deactivate")
+      cmd_wp "$name" plugin list --status=active
+      echo ""
+      local slug
+      read -rp "Plugin slug to deactivate: " slug
+      [[ -z "$slug" ]] && { warn "No slug entered."; return; }
+      cmd_wp "$name" plugin deactivate "$slug"
+      ;;
+    *"Theme list")
+      cmd_wp "$name" theme list
+      ;;
+    *"Theme activate")
+      local slug
+      read -rp "Theme slug: " slug
+      [[ -z "$slug" ]] && { warn "No slug entered."; return; }
+      cmd_wp "$name" theme activate "$slug"
+      ;;
+    *"User list")
+      cmd_wp "$name" user list
+      ;;
+    *"Create user")
+      local username email role
+      read -rp "Username: " username
+      [[ -z "$username" ]] && { warn "No username entered."; return; }
+      read -rp "Email: " email
+      [[ -z "$email" ]] && { warn "No email entered."; return; }
+      role=$(gum choose --header "Role" --cursor "▸ " --cursor.foreground 99 \
+        "administrator" "editor" "author" "contributor" "subscriber") || return
+      cmd_wp "$name" user create "$username" "$email" --role="$role"
+      ;;
+    *"Option get")
+      local opt
+      read -rp "Option name: " opt
+      [[ -z "$opt" ]] && { warn "No option entered."; return; }
+      cmd_wp "$name" option get "$opt"
+      ;;
+    *"Option update")
+      local opt val
+      read -rp "Option name: " opt
+      [[ -z "$opt" ]] && { warn "No option entered."; return; }
+      read -rp "New value: " val
+      cmd_wp "$name" option update "$opt" "$val"
+      ;;
+    *"Search-replace")
+      local old_val new_val
+      read -rp "Search for: " old_val
+      [[ -z "$old_val" ]] && { warn "No value entered."; return; }
+      read -rp "Replace with: " new_val
+      [[ -z "$new_val" ]] && { warn "No value entered."; return; }
+      header "Dry run..."
+      cmd_wp "$name" search-replace "$old_val" "$new_val" --dry-run
+      echo ""
+      if gum confirm "Apply this search-replace?" --default=false; then
+        cmd_wp "$name" search-replace "$old_val" "$new_val"
+      else
+        log "Aborted."
+      fi
+      ;;
+    *"Cache flush")
+      cmd_wp "$name" cache flush
+      ;;
+    *"Custom command")
+      local wp_args
+      read -rp "WP-CLI command: " wp_args
+      [[ -z "$wp_args" ]] && { warn "No command entered."; return; }
+      # shellcheck disable=SC2086
+      cmd_wp "$name" $wp_args
+      ;;
+  esac
+  ui_pause
+}
+
+ui_db_import() {
+  local name
+  name=$(ui_pick_site "Import database for which site?") || return
+  echo "Select the SQL file to import:"
+  local file
+  file=$(cd "$HOME" && gum file --all) || return
+  [[ -z "$file" ]] && { warn "No file selected."; return; }
+  # Resolve to absolute path since gum file returns relative to $HOME
+  file="$HOME/$file"
+  if [[ "$file" != *.sql && "$file" != *.sql.gz ]]; then
+    warn "File must be .sql or .sql.gz"
+    ui_pause
+    return
+  fi
+  gum confirm "Import '$file' into $(get_site_config "$name" DB_NAME)?" || { log "Aborted."; return; }
+  cmd_db_import "$name" "$file"
+  ui_pause
+}
+
+ui_db_export() {
+  local name
+  name=$(ui_pick_site "Export database for which site?") || return
+  local export_dir="$SITES_DIR/$name/exports"
+  mkdir -p "$export_dir"
+  local outfile="$export_dir/${name}_$(date +%Y%m%d_%H%M%S).sql"
+  cmd_db_export "$name" "$outfile"
+  ui_pause
+}
+
+ui_db_shell() {
+  local sites=()
+  sites+=("🔑  Root (all databases)")
+  for d in "$SITES_DIR"/*/; do
+    [[ -f "$d/.iota" ]] || continue
+    local site_name; site_name="$(basename "$d")"
+    local domain; domain="$(get_site_config "$site_name" DOMAIN)"
+    local status="⏹"
+    if docker ps --filter "name=${site_name}_wordpress" --filter "status=running" -q 2>/dev/null | grep -q .; then
+      status="🟢"
+    fi
+    sites+=("$status  $site_name ($domain)")
+  done
+
+  local selected
+  selected=$(gum choose --header "Database shell for which site?" --cursor "▸ " --cursor.foreground 99 "${sites[@]}") || return
+
+  echo ""
+  log "Opening MySQL shell. Type 'exit' to return to iota."
+
+  if [[ "$selected" == *"Root"* ]]; then
+    docker exec -it "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PASS"
+  else
+    local name
+    name=$(echo "$selected" | sed 's/^[^ ]*  //' | sed 's/ (.*//')
+    cmd_db_shell "$name"
+  fi
+  ui_pause
+}
+
+ui_shell() {
+  local name
+  name=$(ui_pick_running_site "Shell into which site?") || return
+  echo ""
+  log "Opening bash shell. Type 'exit' to return to iota."
+  cmd_shell "$name"
+  ui_pause
+}
+
+ui_logs() {
+  local name
+  name=$(ui_pick_running_site "View logs for which site?") || return
+  echo ""
+  log "Tailing logs. Press Ctrl+C to return to iota."
+  cmd_logs "$name" || true
+  ui_pause
+}
+
+cmd_ui() {
+  ensure_gum
+
+  clear
+  gum style \
+    --foreground 99 --border-foreground 99 \
+    --border double --align center \
+    --width 50 --margin "1 0" --padding "1 2" \
+    '⚡ iota' 'Local WordPress Development'
+
+  while true; do
+    echo ""
+    local choice
+    choice=$(gum choose \
+      --header "$(gum style --foreground 99 --bold '  MAIN MENU')" \
+      --cursor "▸ " --height 20 \
+      --cursor.foreground 99 \
+      --selected.foreground 99 \
+      "🆕  Create a new site" \
+      "▶️  Start a site" \
+      "⏹️  Stop a site" \
+      "🗑️  Destroy a site" \
+      "📋  List all sites" \
+      "🌐  Open site in browser" \
+      "📦  Run Composer install" \
+      "⚙️  Run WP-CLI command" \
+      "📥  Import database" \
+      "📤  Export database" \
+      "🐚  Open database shell" \
+      "💻  Open site shell" \
+      "📜  Tail site logs" \
+      "🟢  Start shared services" \
+      "🔴  Stop shared services" \
+      "📊  Show services status" \
+      "📖  View README" \
+      "👋  Exit") || break
+
+    case "$choice" in
+      *"Create a new site")      ui_create ;;
+      *"Start a site")           ui_start ;;
+      *"Stop a site")            ui_stop ;;
+      *"Destroy a site")         ui_destroy ;;
+      *"List all sites")         ui_list; ui_pause ;;
+      *"Open site in browser")   ui_open ;;
+      *"Run Composer install")   ui_compose ;;
+      *"Run WP-CLI command")     ui_wp ;;
+      *"Import database")        ui_db_import ;;
+      *"Export database")        ui_db_export ;;
+      *"Open database shell")    ui_db_shell ;;
+      *"Open site shell")        ui_shell ;;
+      *"Tail site logs")         ui_logs ;;
+      *"Start shared services")  cmd_services_start; ui_pause ;;
+      *"Stop shared services")   cmd_services_stop; ui_pause ;;
+      *"Show services status")   cmd_services_status; ui_pause ;;
+      *"View README")            glow -p "$SCRIPT_DIR/README.md" ;;
+      *"Exit")                   break ;;
+      "")                        break ;;
+      *)                         continue ;;
+    esac
+  done
+
+  echo ""
+  gum style --foreground 99 "👋 Goodbye!"
+}
+
 # ─── Router ───────────────────────────────────────────────────────────────────
 main() {
   local cmd="${1:-help}"; shift || true
@@ -692,6 +1165,7 @@ main() {
     logs)      cmd_logs "$@" ;;
     open)      cmd_open "$@" ;;
     wp)        cmd_wp "$@" ;;
+    ui)        cmd_ui ;;
     help|--help|-h) cmd_help ;;
     *) error "Unknown command: $cmd"; cmd_help; exit 1 ;;
   esac
