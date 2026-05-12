@@ -374,6 +374,25 @@ require_once ABSPATH . 'wp-settings.php';
 WPCONFIGEOF
   success "wp-config.php generated"
 
+  # ── Search-Replace-DB bootstrap ──────────────────────────────────────────────
+  # Pre-fills DB credentials so the tool connects automatically on first load.
+  # Bind-mounted as the DirectoryIndex for /srdb/.
+  log "Generating Search-Replace-DB config..."
+  cat > "$meta_dir/srdb.php" << SRDBEOF
+<?php
+// iota — Pre-fill DB credentials for Search-Replace-DB.
+if ( empty( \$_POST['name'] ) ) {
+    \$_POST['name'] = '${db_name}';
+    \$_POST['user'] = '${db_user}';
+    \$_POST['pass'] = '${db_pass}';
+    \$_POST['host'] = 'iota_mysql';
+    \$_POST['port'] = '3306';
+}
+chdir( '/var/www/html/vendor/interconnectit/search-replace-db' );
+require '/var/www/html/vendor/interconnectit/search-replace-db/index.php';
+SRDBEOF
+  success "Search-Replace-DB config generated"
+
   # ── Apache vhost ─────────────────────────────────────────────────────────────
   # Apache serves HTTP only on port 80 — SSL is terminated by Traefik.
   # Traefik sets X-Forwarded-Proto: https, which wp-config.php picks up.
@@ -407,6 +426,16 @@ WPCONFIGEOF
         Options FollowSymLinks
         AllowOverride All
         Require all granted
+    </Directory>
+
+    # Search-Replace-DB web UI (local dev tool)
+    Alias /replace /var/www/html/vendor/interconnectit/search-replace-db
+
+    <Directory /var/www/html/vendor/interconnectit/search-replace-db>
+        Options FollowSymLinks
+        AllowOverride None
+        Require all granted
+        DirectoryIndex srdb.php index.php
     </Directory>
 
     ErrorLog  \${APACHE_LOG_DIR}/error.log
@@ -448,6 +477,7 @@ services:
       - ${site_dir}:/var/www/html
       - ${meta_dir}/apache/iota.conf:/etc/apache2/sites-enabled/iota.conf:ro
       - ${meta_dir}/wp-config.php:/var/www/html/public/wp-config.php:ro
+      - ${meta_dir}/srdb.php:/var/www/html/vendor/interconnectit/search-replace-db/srdb.php:ro
     command: apache2-foreground
     networks:
       - iota_services
@@ -708,7 +738,8 @@ cmd_compose() {
     "require": {
         "composer/installers": "^2.2",
         "johnpbloch/wordpress": "^6.3.0",
-        "wpackagist-theme/twentytwentyfive": "^1.0"
+        "wpackagist-theme/twentytwentyfive": "^1.0",
+        "interconnectit/search-replace-db": "^4.1"
     },
     "config": {
         "allow-plugins": {
